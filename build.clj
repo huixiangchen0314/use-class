@@ -37,9 +37,9 @@
       (b/compile-clj {:basis basis
                       :src-dirs ["src"]
                       :class-dir class-dir
-                      :ns-compile ['top.kzre.use-class.core
+                      :ns-compile ['top.kzre.use-class.corex
                                    'top.kzre.use-class.spec]})
       (b/uber {:class-dir class-dir
                :uber-file uber-file
                :basis basis
-               :main 'top.kzre.use-class.core}))
+               :main 'top.kzre.use-class.corex}))

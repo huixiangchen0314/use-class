@@ -1,314 +1,309 @@
 (ns top.kzre.use-class.core
-  "数据驱动的 Java 实现复用引擎。"
-  (:require [clojure.spec.alpha :as s]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [top.kzre.use-class.spec :as spec])
-  (:import (java.lang.reflect Method)
-           (java.util Optional)))
+  (:import (java.lang.reflect Method)))
 
-;; ============================================================
-;; 内部工具：Java 反射分析
-;; ============================================================
-(defn- bean-method->fn-symbol
-  "默认命名规则：getXxx -> xxx, setXxx -> set-xxx!, isXxx -> xxx?, 其余驼峰转连字符。"
-  [^Method m]
-  (let [name (.getName m)
-        [prefix body bang?]
-        (cond
-          (re-find #"^get[A-Z]" name) [nil (subs name 3) false]
-          (re-find #"^set[A-Z]" name) ["set" (subs name 3) true]
-          (re-find #"^is[A-Z]" name)  [nil (str (subs name 2) "?") false]
-          :else                        [nil name false])
-        hyphenated (-> body
-                       (str/replace #"([A-Z])" #(str "-" (.toLowerCase (second %))))
-                       (str/replace #"^-" ""))
-        full (str (when prefix (str prefix "-")) hyphenated (when bang? "!"))]
-    (symbol full)))
+;; ── 工具函数 ──
+(defn ->sym [x] (if (symbol? x) x (symbol (str x))))
 
-(defn- method-params
-  "返回方法参数名向量 (arg0 arg1 ...)，长度等于参数个数（不含 this）。"
-  [^Method m]
-  (let [cnt (.getParameterCount m)]
-    (mapv (fn [i] (symbol (str "arg" i))) (range cnt))))
-
-(defn- analyze-java-class*
-  "反射分析 Java 类/接口，返回方法信息 map 序列。"
+(defn derive-protocol-name
+  "从 Java 类名推导协议名：简单类名前加 I。"
   [class-sym]
-  (let [cls (resolve class-sym)
-        _ (when-not cls (throw (Exception. (str "Class not found: " class-sym))))
-        methods (.getMethods cls)]
-    (for [^Method m methods
-          :when (not (contains? #{:equals :hashCode :toString :getClass :notify :notifyAll :wait}
-                                (keyword (.getName m))))]
-      {:java-name   (.getName m)
-       :clj-name    (bean-method->fn-symbol m)
-       :return-type (.getReturnType m)
-       :param-types (vec (.getParameterTypes m))
-       :param-count (.getParameterCount m)})))
+  (let [simple (-> (str class-sym)
+                   (str/replace #"^.*\." "")
+                   (str/replace #"^I" ""))]
+    (symbol (str "I" simple))))
 
-;; ============================================================
-;; 方法条目数据结构
-;; ============================================================
-(defn- method-info->entry
-  [{:keys [clj-name java-name param-count return-type param-types]}]
-  {:sym clj-name
-   :impl (symbol (str "." java-name))
-   :arity (inc param-count)
-   :return-type return-type
-   :param-types param-types
-   :java-name java-name})
+(defn- unwrap-danger [method-sym]
+  (let [s (name method-sym)]
+    (if (str/ends-with? s "!")
+      (symbol (subs s 0 (dec (count s))))
+      method-sym)))
 
-;; ============================================================
-;; 高阶函数：分析 Java 类
-;; ============================================================
-(defn analyze-class
-  "分析 Java 类/接口，返回自动映射的方法条目向量。"
-  [class-sym]
-  (mapv method-info->entry (analyze-java-class* class-sym)))
+(defn- kebab->camel-safe [method-sym]
+  "安全地将 kebab-case 转换为 camelCase，失败返回 nil。"
+  (let [s (name method-sym)
+        parts (str/split s #"-")]
+    (if (= 1 (count parts))
+      method-sym
+      (let [prefix (first parts)
+            rest-words (rest parts)]
+        (if (#{"get" "set" "is"} prefix)
+          (symbol (str prefix (apply str (map str/capitalize rest-words))))
+          nil)))))
 
-;; ============================================================
-;; 高阶函数：穿透委托 (via)
-;; ============================================================
-(defn- protocol-method->java-getter
-  "从协议方法名推导 Java getter 方法名（驼峰式 + get 前缀）。"
-  [sym]
-  (let [parts (str/split (name sym) #"-")
-        capitalized (map str/capitalize parts)
-        camel (apply str capitalized)]
-    (symbol (str "get" camel))))
+(defn- find-method-by-name-and-arity [cls method-name arity]
+  (some #(when (and (= (.getName ^Method %) (name method-name))
+                    (= (.getParameterCount ^Method %) arity))
+           %)
+        (.getMethods cls)))
 
-;; via-methods 现在需要 host-class 参数
-(defn via-methods
-  "host-class: Java 类符号，getter: 该类上的无参方法符号，entries: 同前。
-   示例: (via-methods 'com.example.Foo :getHelper [[:helper-method]])"
-  [host-class getter entries]
-  (let [host-cls (resolve host-class)
-        _ (when-not host-cls
-            (throw (Exception. (str "Host class not found: " host-class))))
-        getter-method (some #(when (= (.getName %) (name getter)) %)
-                            (.getMethods host-cls))
-        _ (when-not getter-method
-            (throw (Exception. (str "Getter method " getter " not found in " host-class))))
-        target-class (.getReturnType getter-method)
-        _ (when-not target-class
-            (throw (Exception. (str "Cannot determine return type of getter " getter " in " host-class))))]
-    (mapv (fn [entry]
-            (let [[proto-method target-method] (if (= (count entry) 1)
-                                                 [(first entry) (protocol-method->java-getter (first entry))]
-                                                 entry)
-                  method-obj (some #(when (= (.getName %) (name target-method)) %)
-                                   (.getMethods target-class))
-                  _ (when-not method-obj
-                      (throw (Exception. (str "Method " target-method " not found in " (.getName target-class)))))
-                  arity (inc (.getParameterCount method-obj))
-                  return-type (.getReturnType method-obj)
-                  param-types (vec (.getParameterTypes method-obj))
-                  param-names (method-params method-obj)]
-              {:sym proto-method
-               :impl `(fn [~'this ~@param-names]
-                        (let [obj# (~(symbol (str "." (name getter))) ~'this)]
-                          (~(symbol (str "." (name target-method))) obj# ~@param-names)))
-               :arity arity
-               :return-type return-type
-               :param-types param-types}))
-          entries)))
+(defonce ^:private object-method-names
+         (->> (.getMethods Object)
+              (map #(.getName ^Method %))
+              set))
 
-;; ============================================================
-;; 高阶函数：自定义方法
-;; ============================================================
-(defn custom-entry [sym arity f]
-  {:sym sym :impl f :arity arity :return-type nil :param-types []})
+;; ── 步骤 1：解析 Java 类型 ──
+(defn- method->sig [^Method m]
+  (let [proto-name  (symbol (.getName m))
+        param-types (.getParameterTypes m)
+        params      (->> param-types
+                         (map #(symbol (.getName ^Class %)))
+                         (cons 'this)
+                         vec)
+        return      (symbol (.getName (.getReturnType m)))]
+    [proto-name params return]))
 
-(defn custom-methods [specs]
-  (mapv (fn [[sym arity f]] (custom-entry sym arity f)) specs))
+(defn resolve-type [type-sym]
+  (let [cls (resolve type-sym)]
+    (when-not cls
+      (throw (IllegalArgumentException. (str "无法解析的 Java 类型: " type-sym))))
+    {::spec/type-name type-sym
+     ::spec/method-sigs (->> (.getMethods cls)
+                             (remove (comp object-method-names #(.getName ^Method %)))
+                             (mapv method->sig))}))
 
-;; ============================================================
-;; 高阶函数：组合与过滤
-;; ============================================================
-(defn merge-methods [& colls]
-  (let [all (apply concat colls)]
-    (vals (reduce (fn [m e] (assoc m (:sym e) e)) {} all))))
+;; ── 步骤：合并额外方法 ──
+(defn merge-extra-methods [type-def delegate-config custom-config]
+  (let [existing-names (set (map #(->sym (first %)) (::spec/method-sigs type-def)))
+        extra-sigs
+        (concat
+          (for [entry delegate-config
+                :let [proto-fn (->sym (first entry))]
+                :when (not (contains? existing-names proto-fn))]   ;; 避免冲突
+            [proto-fn '[this] nil])
+          (for [[proto-fn arity custom-fn] custom-config
+                :let [proto-fn (->sym proto-fn)]
+                :when (not (contains? existing-names proto-fn))]   ;; 避免冲突
+            (let [params (into ['this] (repeat (dec arity) 'java.lang.Object))]
+              [proto-fn params nil])))]
+    (update type-def ::spec/method-sigs into extra-sigs)))
 
-(defn filter-methods [methods & {:keys [except only]}]
-  (cond
-    only   (filter #(contains? (set only) (:sym %)) methods)
-    except (remove #(contains? (set except) (:sym %)) methods)
-    :else methods))
+;; ── 步骤 2：重命名 ──
+(defn rename-methods-in-type-def [type-def rename-map rename-fn]
+  (let [newname (fn [orig-name]
+                  (->sym (or (get rename-map orig-name)
+                             (when rename-fn (rename-fn orig-name))
+                             orig-name)))]
+    (update type-def ::spec/method-sigs
+            (fn [sigs]
+              (mapv (fn [[method-name params return]]
+                      [(newname method-name) params return])
+                    sigs)))))
 
-(defn rename-methods [methods mapping]
-  (mapv (fn [m] (if-let [new-sym (get mapping (:sym m))]
-                  (assoc m :sym new-sym)
-                  m))
-        methods))
+;; ── 步骤 3：过滤 ──
+(defn filter-methods-in-type-def [type-def default-include include exclude & {:keys [filter-fn]}]
+  (let [include-set (set (map ->sym include))
+        exclude-set (set (map ->sym exclude))
+        pred (or filter-fn
+                 (if default-include
+                   #(not (contains? exclude-set (->sym %)))
+                   #(contains? include-set (->sym %))))]
+    (update type-def ::spec/method-sigs
+            (fn [sigs]
+              (filterv (fn [[method-sym & _]] (pred (->sym method-sym))) sigs)))))
 
-;; ============================================================
-;; 高阶函数：后处理
-;; ============================================================
-(defn mark-dangerous [methods dangerous-set]
-  (let [dset (set (map name dangerous-set))]
-    (mapv (fn [m]
-            (let [sname (name (:sym m))]
-              (if (and (contains? dset sname)
-                       (not (str/ends-with? sname "!")))
-                (assoc m :sym (symbol (str sname "!")))
-                m)))
-          methods)))
+;; ── 步骤 4：危险标记 ──
+(defn- setter-name? [sym]
+  (let [s (name sym)]
+    (and (str/starts-with? s "set-") (> (count s) 4))))
 
-(defn apply-name-mapper [methods mapper-fn]
-  (mapv (fn [m] (assoc m :sym (mapper-fn (:sym m)))) methods))
+(defn mark-dangerous-in-type-def [type-def danger-set & {:keys [setter-danger?] :or {setter-danger? true}}]
+  (update type-def ::spec/method-sigs
+          (fn [sigs]
+            (mapv (fn [[method-name :as sig]]
+                    (let [mn (->sym method-name)]
+                      (if (and (not (str/ends-with? (name mn) "!"))
+                               (or (contains? danger-set mn)
+                                   (and setter-danger? (setter-name? mn))))
+                        [(symbol (str (name mn) "!")) (nth sig 1) (nth sig 2)]
+                        sig)))
+                  sigs))))
 
-;; ============================================================
-;; 返回值自动转换
-;; ============================================================
-(defonce ^:private result-converters (atom {}))
+;; ── 步骤 5：实现注入策略 ──
+(defn direct-impl-policy [& {:keys [rename-inverse]}]
+  (fn [[method-name params return] cls]
+    (let [protocol-name (unwrap-danger method-name)
+          ;; 优先使用 kebab->camel 转换，其次使用 rename 逆映射，最后使用原始名
+          java-name (or (kebab->camel-safe protocol-name)
+                        (get rename-inverse protocol-name)
+                        protocol-name)
+          arity (dec (count params))]
+      (when (find-method-by-name-and-arity cls java-name arity)
+        [method-name params return {:delegate java-name}]))))
 
-(defn register-result-converter! [class converter]
-  (let [clz (if (class? class) class (resolve class))]
-    (when clz (swap! result-converters assoc clz converter))))
+(defn delegate-impl-policy [delegate-config]
+  (let [mapping
+        (into {}
+              (map (fn [entry]
+                     (let [proto-fn (->sym (first entry))
+                           getter   (second entry)
+                           target   (if (= (count entry) 2)
+                                      (or (kebab->camel-safe proto-fn)
+                                          (throw (IllegalArgumentException.
+                                                   (str "无法从协议方法名 '" proto-fn
+                                                        "' 推导目标方法名，请使用三元素形式 [协议方法 getter target]"))))
+                                      (nth entry 2))]
+                       [proto-fn {:delegate {:getter getter :method target}}])))
+              delegate-config)]
+    (fn [[method-name params return] cls]
+      (when-let [impl (get mapping (->sym method-name))]
+        [method-name params return impl]))))
 
-(defn- builtin-result-converters []
-  (register-result-converter! Optional (fn [^Optional opt] (when (.isPresent opt) (.get opt)))))
+(defn custom-impl-policy [custom-config]
+  (let [mapping (into {} (map (fn [[k _ f]] [(->sym k) {:custom f}]) custom-config))]
+    (fn [[method-name params return] cls]
+      (when-let [impl (get mapping (->sym method-name))]
+        [method-name params return impl]))))
 
-(builtin-result-converters)
+(defn smart-delegate-policy [& {:keys [rename-inverse]}]
+  (fn [[method-name params return] cls]
+    (let [protocol-name (unwrap-danger method-name)
+          java-name (or (kebab->camel-safe protocol-name)
+                        (get rename-inverse protocol-name)
+                        protocol-name)
+          arity (dec (count params))]
+      (some (fn [^Method g]
+              (when (and (zero? (.getParameterCount g))
+                         (not= java.lang.Void/TYPE (.getReturnType g)))
+                (when-let [target (find-method-by-name-and-arity (.getReturnType g) java-name arity)]
+                  [method-name params return
+                   {:delegate {:getter (symbol (.getName g))
+                               :method java-name}}])))
+            (.getMethods cls)))))
+(defn merge-impl-policies [& policies]
+  (fn [sig cls]
+    (some #(% sig cls) policies)))
 
-(defn auto-wrap-results [methods]
-  (mapv (fn [{:keys [return-type impl arity] :as m}]
-          (if-let [converter (and return-type (get @result-converters return-type))]
-            (let [param-names (map (fn [i] (symbol (str "arg" i))) (range (dec arity)))]
-              (assoc m :impl
-                       `(fn [~'this ~@param-names]
-                          (let [result# (~impl ~'this ~@param-names)]
-                            (~converter result#)))))
-            m))
-        methods))
+(def default-impl-policy
+  (merge-impl-policies (custom-impl-policy {})
+                       (direct-impl-policy)
+                       (smart-delegate-policy)))
 
-(defn wrap-results [methods mapping]
-  (mapv (fn [{:keys [sym impl arity] :as m}]
-          (if-let [converter (get mapping sym)]
-            (let [param-names (map (fn [i] (symbol (str "arg" i))) (range (dec arity)))]
-              (assoc m :impl
-                       `(fn [~'this ~@param-names]
-                          (let [result# (~impl ~'this ~@param-names)]
-                            (~converter result#)))))
-            m))
-        methods))
+(defn inject-impl-in-type-def [type-def impl-policy]
+  (let [cls (resolve (::spec/type-name type-def))]
+    (when-not cls (throw (ex-info "Cannot resolve type" {:type (::spec/type-name type-def)})))
+    (update type-def ::spec/method-sigs
+            (fn [sigs]
+              (mapv (fn [sig]
+                      (or (impl-policy sig cls)
+                          (throw (ex-info (str "No implementation found for " (first sig))
+                                          {:method (first sig)}))))
+                    sigs)))))
 
-(defn wrap-args [methods specs]
-  (mapv (fn [{:keys [sym impl arity] :as m}]
-          (if-let [arg-specs (get specs sym)]
-            (let [param-names (map (fn [i] (symbol (str "arg" i))) (range (dec arity)))
-                  converted-args (map-indexed (fn [i pname]
-                                                (if-let [[_ converter] (some #(when (= (first %) i) %) arg-specs)]
-                                                  `(~converter ~pname)
-                                                  pname))
-                                              param-names)]
-              (assoc m :impl
-                       `(fn [~'this ~@param-names]
-                          (~impl ~'this ~@converted-args))))
-            m))
-        methods))
+;; ── 步骤 6：包装器 ──
+(defn wrap-impl-in-type-def [type-def wrappers-config]
+  (let [global-wrappers (get wrappers-config :global [])
+        method-wrappers (get wrappers-config :methods {})]
+    (update type-def ::spec/method-sigs
+            (fn [sigs]
+              (mapv (fn [sig]
+                      (let [method-name (->sym (first sig))
+                            wrappers (vec (concat global-wrappers (get method-wrappers method-name [])))]
+                        (conj (vec sig) wrappers)))
+                    sigs)))))
 
-;; ============================================================
-;; 终结宏
-;; ============================================================
-(defmacro extend-by-methods
-  "接受字面量方法条目向量，生成 extend-type 形式。
-   用法：
-   (extend-by-methods String MyProto
-     [{:sym 'hello, :impl (fn [this] \"world\"), :arity 1}])"
-  [java-class protocol-name methods-vec]
-  ;; 直接使用字面量向量，不需要 eval
-  `(extend-type ~java-class
-     ~protocol-name
-     ~@(mapcat (fn [{:keys [sym impl arity]}]
-                 (let [params (repeatedly (dec arity) #(gensym "arg"))]
-                   `((~sym [~'this ~@params] (~impl ~'this ~@params)))))
-               methods-vec)))
+;; ── 代码生成 ──
+(defn type-def->protocol-def [type-def proto-name]
+  (let [sigs (::spec/method-sigs type-def)
+        names (map #(->sym (first %)) sigs)
+        duplicates (keys (filter (fn [[_ v]] (> v 1)) (frequencies names)))]
+    (when (seq duplicates)
+      (throw (ex-info (str "协议方法名冲突：" (str/join ", " (map name duplicates))
+                           "。请使用 :rename 选项手动重命名以解决冲突。")
+                      {:duplicates duplicates})))
+    {::spec/protocol-name (->sym proto-name)
+     ::spec/protocol-method-sigs
+     (mapv (fn [[name params _]]
+             (let [arity (dec (count params))]
+               [(->sym name) (into ['this] (repeatedly arity #(gensym "arg")))]))
+           sigs)}))
 
+(defn emit-defprotocol [protocol-def]
+  (let [proto-name (->sym (::spec/protocol-name protocol-def))
+        sigs (::spec/protocol-method-sigs protocol-def)]
+    `(defprotocol ~proto-name
+       ~@(for [[name params] sigs]
+           `(~(->sym name) ~params)))))
 
-(defn extend-by-methods*
-  "运行时版本：根据方法条目向量动态扩展类型。
-   用法：(extend-by-methods* MyClass MyProto methods-vec)"
-  [java-class protocol-name methods-vec]
-  (eval `(extend-type ~java-class
-           ~protocol-name
-           ~@(mapcat (fn [{:keys [sym impl arity]}]
-                       (let [params (repeatedly (dec arity) #(gensym "arg"))]
-                         `((~sym [~'this ~@params] (~impl ~'this ~@params)))))
-                     methods-vec))))
+(defn- impl-expr [impl-map this-sym arg-syms]
+  (let [[type val] (first impl-map)]
+    (case type
+      :delegate (if (symbol? val)
+                  `(. ~this-sym ~val ~@arg-syms)
+                  (let [getter (:getter val)
+                        method (:method val)]
+                    `(let [obj# (. ~this-sym ~getter)]
+                       (. obj# ~method ~@arg-syms))))
+      :custom `(~val ~this-sym ~@arg-syms))))  ;; 直接使用 val
 
-;; ============================================================
-;; 快捷宏：define-class 和 use-class（修复 + spec 集成）
-;; ============================================================
-(defn- apply-name-mapper-and-dangerous [methods-info {:keys [name-mapper dangerous]}]
-  (let [dangerous-set (set (map name dangerous))
-        mapper-fn (when name-mapper (deref (resolve name-mapper)))]
-    (mapv (fn [m]
-            (let [clj (if mapper-fn (mapper-fn m) (:clj-name m))
-                  clj (if (and dangerous-set (contains? dangerous-set (name clj))
-                               (not (str/ends-with? (name clj) "!")))
-                        (symbol (str (name clj) "!"))
-                        clj)]
-              (assoc m :clj-name clj)))
-          methods-info)))
+(defn- wrap-expr [wrappers inner-expr this-sym arg-syms]
+  (reduce (fn [expr wrapper-sym]
+            `(~wrapper-sym (fn [~this-sym ~@arg-syms] ~expr)))
+          inner-expr
+          wrappers))
 
-(defmacro define-class
-  [java-interface protocol-name & opts]
-  (let [;; 使用 spec 校验选项
-        _ (s/assert ::spec/adapter-options (apply hash-map opts))
-        {:keys [name-mapper dangerous]} (apply hash-map opts)
-        methods-info (analyze-java-class* java-interface)
-        methods-info (apply-name-mapper-and-dangerous methods-info {:name-mapper name-mapper :dangerous dangerous})
-        method-sigs (for [m methods-info]
-                      ;; 修复：基于 :param-count 生成参数
-                      (list (:clj-name m) ['this] (repeatedly (:param-count m) (fn [] (gensym "arg")))))]
-    `(defprotocol ~protocol-name ~@method-sigs)))
+(defn emit-extend-type [type-def protocol-def]
+  (let [type-sym (->sym (::spec/type-name type-def))
+        proto-sym (->sym (::spec/protocol-name protocol-def))
+        sigs (::spec/method-sigs type-def)
+        proto-method-map (into {} (::spec/protocol-method-sigs protocol-def))
+        clauses (for [[name _ _ impl wrappers] sigs
+                      :let [proto-params (get proto-method-map (->sym name))
+                            this-sym (first proto-params)
+                            arg-syms (rest proto-params)
+                            params-vec (vec proto-params)
+                            body (wrap-expr wrappers
+                                            (impl-expr impl this-sym arg-syms)
+                                            this-sym arg-syms)]]
+                  `(~(->sym name) ~params-vec ~body))]
+    `(extend-type ~type-sym ~proto-sym ~@clauses)))
 
-(defmacro use-class
-  [java-class protocol-name & opts]
-  (let [;; spec 校验
-        _ (s/assert ::spec/adapter-options (apply hash-map opts))
-        {:keys [except rename custom only name-mapper dangerous via]
-         :or {except [] rename {} custom {} only nil via []}} (apply hash-map opts)
-        methods-info (analyze-java-class* java-class)
-        methods-info (apply-name-mapper-and-dangerous methods-info {:name-mapper name-mapper :dangerous dangerous})
-        via-method-names (set (map first via))
-        except-set (set (map name except))
-        methods-info (cond
-                       only   (filter #(contains? (set (map name only)) (name (:clj-name %))) methods-info)
-                       :else  (remove #(or (contains? except-set (name (:clj-name %)))
-                                           (contains? via-method-names (name (:clj-name %))))
-                                      methods-info))
-        auto-impls (for [m methods-info
-                         :let [clj-name (or (get rename (:java-name m)) (:clj-name m))
-                               params (repeatedly (:param-count m) (fn [] (gensym "arg")))]]
-                     (if-let [cfn (get custom clj-name)]
-                       `(~clj-name [~'this ~@params] (~cfn ~'this ~@params))
-                       (let [jcall (symbol (str "." (:java-name m)))]
-                         `(~clj-name [~'this ~@params] (~jcall ~'this ~@params)))))
-        via-impls (mapcat (fn [entry]
-                            (let [[proto-method getter target-method] (if (= (count entry) 2)
-                                                                        [(first entry) (second entry) (protocol-method->java-getter (first entry))]
-                                                                        entry)
-                                  target-class-sym (some-> (resolve getter) .getReturnType .getName symbol)
-                                  target-class (resolve target-class-sym)
-                                  method-obj (some #(when (= (.getName %) (name target-method)) %) (.getMethods target-class))
-                                  params (repeatedly (.getParameterCount method-obj) (fn [] (gensym "arg")))]
-                              `((~proto-method [~'this ~@params]
-                                  (let [obj# (~(symbol (str "." (name getter))) ~'this)]
-                                    (~(symbol (str "." (name target-method))) obj# ~@params))))))
-                          via)
-        extra-custom (for [[cname cfn] custom
-                           :when (not (some #(= cname (first %)) auto-impls))]
-                       `(~cname [~'this ~'& args#] (apply ~cfn ~'this args#)))]
-    `(extend-type ~java-class
-       ~protocol-name
-       ~@(apply concat (concat auto-impls via-impls extra-custom)))))
+;; ── 顶层宏 ──
+(defmacro defprotocol-from-type [java-class & opts]
+  (let [{:keys [protocol-name rename rename-fn only except filter dangerous setter-danger? delegate custom]
+         :or {rename {} dangerous #{} setter-danger? true delegate [] custom []}}
+        (apply hash-map opts)
+        proto-name (->sym (or protocol-name (derive-protocol-name java-class)))
+        type-def (resolve-type java-class)
+        type-def (rename-methods-in-type-def type-def rename rename-fn)
+        type-def (merge-extra-methods type-def delegate custom)
+        type-def (filter-methods-in-type-def type-def (nil? only) only except :filter-fn filter)
+        type-def (mark-dangerous-in-type-def type-def dangerous :setter-danger? setter-danger?)
+        proto-def (type-def->protocol-def type-def proto-name)
+        ;; 实现注入不再需要，因为只生成协议
+        ]
+    (emit-defprotocol proto-def)))
 
-;; 调试工具（保持不变）
-(defn inspect-java-class [class-sym]
-  (let [methods (analyze-java-class* class-sym)]
-    (println "=== Java Class:" class-sym "===")
-    (doseq [m methods]
-      (printf "  %-30s -> %s\n" (:java-name m) (:clj-name m)))
-    (println)))
+(defmacro use-class [java-class & opts]
+  (let [{:keys [protocol-name rename rename-fn only except filter dangerous setter-danger? delegate custom wrappers]
+         :or {rename {} dangerous #{} setter-danger? true delegate [] custom [] wrappers {}}}
+        (apply hash-map opts)
+        proto-name (->sym (or protocol-name (derive-protocol-name java-class)))
+        type-def (resolve-type java-class)
+        type-def (rename-methods-in-type-def type-def rename rename-fn)     ;; 先重命名
+        type-def (merge-extra-methods type-def delegate custom)            ;; 再合并
+        type-def (filter-methods-in-type-def type-def (nil? only) only except :filter-fn filter)
+        type-def (mark-dangerous-in-type-def type-def dangerous :setter-danger? setter-danger?)
+        proto-def (type-def->protocol-def type-def proto-name)
+        ;; 构建 rename 逆映射：新名 -> 原始 Java 方法名
+        rename-inverse (zipmap (vals rename) (keys rename))
+        delegate-config (mapv (fn [entry]
+                                (let [proto-fn (->sym (or (get rename (first entry)) (first entry)))
+                                      getter (second entry)
+                                      target (when (= (count entry) 3) (nth entry 2))]
+                                  (if target [proto-fn getter target] [proto-fn getter])))
+                              delegate)
+        custom-config (mapv (fn [[proto-fn arity f]]
+                              [(->sym (or (get rename proto-fn) proto-fn)) arity f])
+                            custom)
+        policies (merge-impl-policies
+                   (custom-impl-policy custom-config)
+                   (delegate-impl-policy delegate-config)
+                   (direct-impl-policy :rename-inverse rename-inverse)
+                   (smart-delegate-policy :rename-inverse rename-inverse))
+        type-def (inject-impl-in-type-def type-def policies)
+        type-def (wrap-impl-in-type-def type-def wrappers)]
+    `(do
+       ~(emit-defprotocol proto-def)
+       ~(emit-extend-type type-def proto-def))))

@@ -14,20 +14,20 @@ A Clojure library for easily creating protocols and adapters from Java classesâ€
 ### Quick Start
 
 ```clojure
-(require '[top.kzre.use-class.core :as uc])
+(require '[top.kzre.use-class.corex :as uc])
 
 ;; 1. Generate a protocol from a Java interface
 (uc/define-class com.example.WorldFactory WorldFactoryProtocol
-  :except [getClass])   ;; exclude Object methods
+                 :except [getClass])   ;; exclude Object methods
 
 ;; 2. Adapt a class to an existing protocol
 (uc/use-class com.example.WorldInstance IWorld
-  :except [getClass]
-  :rename {getWorldId world-id}
-  :via [[time-millis getGameWorld]         ;; delegate to GameWorld
-        [find-entity getEntityManager :findByEntityId]]
-  :custom {player-positions (fn [this] ...)}
-  :dangerous #{destroy remove})            ;; methods get a ! suffix
+              :except [getClass]
+              :rename {getWorldId world-id}
+              :via [[time-millis getGameWorld]         ;; delegate to GameWorld
+                    [find-entity getEntityManager :findByEntityId]]
+              :custom {player-positions (fn [this] ...)}
+              :dangerous #{destroy remove})            ;; methods get a ! suffix
 
 ;; 3. Inspect a class to see the generated method names
 (uc/inspect-java-class 'com.example.Entity)
