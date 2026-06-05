@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>top.kzre</groupId>
+    <artifactId>use-class</artifactId>
+    <version>0.1.0</version>
+
+    <name>use-class</name>
+    <description>A complete behaviour tree implementation in Clojure</description>
+    <url>https://github.com/huixinagchen0314/use-class</url>
+
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/licenses/MIT</url>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <name>Hui Xiang Chen</name>
+            <email>huixinagchen0314@gemail.com</email>
+        </developer>
+    </developers>
+
+    <scm>
+        <url>https://github.com/huixinagchen0314/use-class</url>
+        <connection>scm:git:git://github.com/huixinagchen0314/use-class.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com:huixinagchen0314/use-class.git</developerConnection>
+    </scm>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.clojure</groupId>
+            <artifactId>clojure</artifactId>
+            <version>1.11.1</version>
+        </dependency>
+    </dependencies>
+</project>
