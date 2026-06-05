@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="BuildSystemProperties">
+    <option name="modules">
+      <map>
+        <entry key="defprotocol-from-interface">
+          <value>
+            <ModuleState>
+              <option name="buildSystemId" value="CLOJURE_DEPS" />
+              <option name="displayName" value="defprotocol-from-interface" />
+            </ModuleState>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+</project>
