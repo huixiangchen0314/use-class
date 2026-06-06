@@ -12,6 +12,7 @@ clean:
 test:
 	clj -M:test -e "(require 'top.kzre.use-class.core-test) (clojure.test/run-tests 'top.kzre.use-class.core-test)"
 	clj -M:test -e "(require 'top.kzre.use-class.wrapper-clean-test) (clojure.test/run-tests 'top.kzre.use-class.wrapper-clean-test)"
+	clj -M:test -e "(require 'top.kzre.use-class.optional-wrapper-test) (clojure.test/run-tests 'top.kzre.use-class.optional-wrapper-test)"
 
 # 构建库 JAR
 jar:
