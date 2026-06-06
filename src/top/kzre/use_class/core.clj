@@ -6,6 +6,40 @@
   (:import
     [java.lang.reflect Method Modifier]))
 
+(defn bean-name->kebab-name
+  "将 Java 方法名符号转为 Clojure kebab-case 符号，保留 get/set/is 前缀。
+   例如：getTime → get-time，setTime → set-time，isReady → is-ready。"
+  [method-sym]
+  (let [name   (name method-sym)
+        [prefix body]
+        (cond
+          (re-find #"^get[A-Z]" name) ["get" (subs name 3)]
+          (re-find #"^set[A-Z]" name) ["set" (subs name 3)]
+          (re-find #"^is[A-Z]" name)  ["is" (subs name 2)]
+          :else                        [nil name])
+        hyphenated (-> body
+                       (str/replace #"([A-Z])" #(str "-" (.toLowerCase (second %))))
+                       (str/replace #"^-" ""))
+        full (str (when prefix (str prefix "-")) hyphenated)]
+    (symbol full)))
+
+(defn bean-name->kebab-name-strip
+  "将 Java 方法名符号转为 Clojure kebab-case 符号，并去除 get/set/is 前缀。
+   例如：getTime → time，setTime → set-time，isReady → ready?。"
+  [method-sym]
+  (let [name   (name method-sym)
+        [prefix body bang?]
+        (cond
+          (re-find #"^get[A-Z]" name) [nil (subs name 3) false]
+          (re-find #"^set[A-Z]" name) ["set" (subs name 3) true]
+          (re-find #"^is[A-Z]" name)  [nil (str (subs name 2) "?") false]
+          :else                        [nil name false])
+        hyphenated (-> body
+                       (str/replace #"([A-Z])" #(str "-" (.toLowerCase (second %))))
+                       (str/replace #"^-" ""))
+        full (str (when prefix (str prefix "-")) hyphenated (when bang? "!"))]
+    (symbol full)))
+
 ;; ── 常量 ──
 (defonce ^:private object-method-names
          (->> (.getMethods Object)
@@ -65,7 +99,7 @@
                          (cons 'this)
                          vec)
         return      (symbol (.getName (.getReturnType m)))]
-    [jname jname params return]))   ;; proto-name = java-name 初始
+    [jname jname params return]))
 
 (defn resolve-type
   [type-sym]
@@ -73,11 +107,11 @@
     (when-not cls
       (throw (IllegalArgumentException. (str "无法解析的 Java 类型: " type-sym))))
     {::spec/type-name type-sym
-     ::spec/method-sigs (->> cls
-                             extract-methods
-                             filter-object-methods
-                             filter-static-methods
-                             (mapv method->sig))}))
+     ::spec/method-sigs (vec (->> cls
+                                  extract-methods
+                                  filter-object-methods
+                                  filter-static-methods
+                                  (mapv method->sig)))}))
 
 ;; ── 重命名 ──
 (defn rename-methods-in-type-def
@@ -88,7 +122,7 @@
                       orig-name))]
     (update type-def ::spec/method-sigs
             (fn [sigs]
-              (mapv (fn [[proto java params return :as sig]]
+              (mapv (fn [[proto java params return]]
                       [(newname proto) java params return])
                     sigs)))))
 
@@ -98,7 +132,7 @@
   (if prefix
     (update type-def ::spec/method-sigs
             (fn [sigs]
-              (mapv (fn [[proto java params return :as sig]]
+              (mapv (fn [[proto java params return]]
                       [(symbol (str prefix (name proto))) java params return])
                     sigs)))
     type-def))
@@ -113,7 +147,7 @@
                #(contains? include-set %))]
     (update type-def ::spec/method-sigs
             (fn [sigs]
-              (filterv (fn [[proto & _]] (pred proto)) sigs)))))
+              (filterv (fn [[proto]] (pred proto)) sigs)))))
 
 ;; ── 危险标记 ──
 (defn- setter-name? [sym]
@@ -124,12 +158,12 @@
   [type-def danger-set & {:keys [setter-danger?] :or {setter-danger? true}}]
   (update type-def ::spec/method-sigs
           (fn [sigs]
-            (mapv (fn [[proto java params return :as sig]]
+            (mapv (fn [[proto java params return]]
                     (if (and (not (str/ends-with? (name proto) "!"))
                              (or (contains? danger-set proto)
                                  (and setter-danger? (setter-name? proto))))
                       [(symbol (str (name proto) "!")) java params return]
-                      sig))
+                      [proto java params return]))
                   sigs))))
 
 ;; ── 去重 ──
@@ -147,7 +181,7 @@
                                {}
                                sigs))))))
 
-;; ── 合并额外方法（委托和自定义） ──
+;; ── 合并额外方法 ──
 (defn merge-extra-methods [type-def delegate-config custom-config]
   (let [existing-names (set (map first (::spec/method-sigs type-def)))
         extra-sigs
@@ -155,7 +189,7 @@
           (for [entry delegate-config
                 :let [proto-fn (->sym (first entry))]
                 :when (not (contains? existing-names proto-fn))]
-            [proto-fn proto-fn '[this] nil])   ;; 占位
+            [proto-fn proto-fn '[this] nil])
           (for [[proto-fn arity custom-fn & [param-types]] custom-config
                 :let [proto-fn (->sym proto-fn)]
                 :when (not (contains? existing-names proto-fn))]
@@ -165,12 +199,12 @@
               [proto-fn proto-fn params nil])))]
     (update type-def ::spec/method-sigs into extra-sigs)))
 
-;; ── 合并 type-def（保留第一个出现的签名） ──
+;; ── 合并 type-def ──
 (defn merge-type-def
   [base-type-def & more-type-defs]
   (let [all-sigs (reduce (fn [sigs td]
-                           (reduce (fn [acc [proto & _ :as sig]]
-                                     (if (some #(= (first %) proto) acc)
+                           (reduce (fn [acc sig]
+                                     (if (some #(= (first %) (first sig)) acc)
                                        acc
                                        (conj acc sig)))
                                    sigs
@@ -179,7 +213,7 @@
                          more-type-defs)]
     (assoc base-type-def ::spec/method-sigs (vec all-sigs))))
 
-;; ── 委托相关工具函数 ──
+;; ── 委托辅助函数 ──
 (defn- find-method-by-name-and-arity [cls method-name arity]
   (some #(when (and (= (.getName ^Method %) (name method-name))
                     (= (.getParameterCount ^Method %) arity))
@@ -188,7 +222,7 @@
 
 (defn resolve-conflict-methods
   [sigs method-name]
-  (let [candidates (filter #(= (second %) method-name) sigs)   ;; 用 java-name 匹配
+  (let [candidates (filter #(= (second %) method-name) sigs)
         _ (when (empty? candidates)
             (throw (ex-info (str "未找到方法 " method-name) {})))
         groups (group-by (fn [[_ _ params _]] (dec (count params))) candidates)
@@ -196,34 +230,18 @@
         top-group (get groups max-arity)]
     (first top-group)))
 
-(defn extract-delegate-type-def
-  [host-class-sym delegate-entry]
-  (let [cls (resolve host-class-sym)
-        _ (when-not cls (throw (IllegalArgumentException. (str "无法解析类型: " host-class-sym))))
-        getter-name (name (second delegate-entry))
-        getter-method (first (filter #(= (.getName ^Method %) getter-name) (.getMethods cls)))
-        _ (when-not getter-method
-            (throw (ex-info (str "在 " host-class-sym " 中找不到方法 " getter-name) {})))
-        ret-class (.getReturnType ^Method getter-method)
-        ret-class-sym (symbol (.getName ret-class))]
-    (resolve-type ret-class-sym)))
-
-(defn gen-delegate-entries
-  [host-class-sym getter-sym]
+(defn gen-delegate-entries [host-class-sym getter-sym]
   (let [host-cls      (resolve host-class-sym)
         _             (when-not host-cls (throw (IllegalArgumentException. (str "无法解析类型: " host-class-sym))))
-        getter-method (first (filter #(= (.getName ^Method %) (name getter-sym))
-                                     (.getMethods host-cls)))
-        _             (when-not getter-method
-                        (throw (ex-info (str "Getter " getter-sym " not found in " host-class-sym) {})))
+        getter-method (first (filter #(= (.getName ^Method %) (name getter-sym)) (.getMethods host-cls)))
+        _             (when-not getter-method (throw (ex-info (str "Getter " getter-sym " not found in " host-class-sym) {})))
         ret-class     (.getReturnType ^Method getter-method)
         ret-class-sym (symbol (.getName ret-class))
         target-td     (resolve-type ret-class-sym)
-        method-names  (map second (::spec/method-sigs target-td))]  ;; 使用 java-name
+        method-names  (map second (::spec/method-sigs target-td))]
     (mapv (fn [m] [m getter-sym]) method-names)))
 
-(defn normalize-delegate-config
-  [host-class-sym raw-config]
+(defn normalize-delegate-config [host-class-sym raw-config]
   (mapcat
     (fn [entry]
       (let [entry (if (and (seq? entry) (= (first entry) 'quote) (= (count entry) 2))
@@ -231,43 +249,34 @@
                     entry)
             entry (if (symbol? entry) [entry] entry)
             entry (mapv ->sym entry)
-            cnt (count entry)]
-        (case cnt
-          1 (gen-delegate-entries host-class-sym (first entry))
-          2 (if (symbol? (first entry))
-              [entry]
-              (let [[getter mappings] entry]
-                (mapv (fn [[proto-fn method]]
-                        [proto-fn getter method])
-                      mappings)))
-          3 [entry]
-          (throw (ex-info (str "无效的委托条目: " entry) {})))))
+            getter (first entry)
+            target-methods (rest entry)]
+        (if (seq target-methods)
+          (mapv (fn [m] [m getter]) target-methods)
+          (gen-delegate-entries host-class-sym getter))))
     raw-config))
 
-(defn merge-type-def-with-delegates
-  [host-type-def delegate-config]
+(defn merge-type-def-with-delegates [host-type-def delegate-config]
   (let [host-class-sym (::spec/type-name host-type-def)
         extra-sigs
         (mapcat
           (fn [entry]
-            (let [proto-fn      (first entry)
-                  getter        (second entry)
-                  target-method (if (= (count entry) 3) (nth entry 2) proto-fn)
+            (let [[target-method getter] entry
                   host-cls      (resolve host-class-sym)
-                  getter-method (first (filter #(= (.getName ^Method %) (name getter))
-                                               (.getMethods host-cls)))
+                  getter-method (first (filter #(= (.getName ^Method %) (name getter)) (.getMethods host-cls)))
                   _             (when-not getter-method
                                   (throw (ex-info (str "Getter " getter " not found in " host-class-sym) {})))
                   ret-class     (.getReturnType ^Method getter-method)
                   ret-class-sym (symbol (.getName ret-class))
                   target-td     (resolve-type ret-class-sym)
+                  ;; 用原始 Java 方法名查找
                   target-sig    (resolve-conflict-methods (::spec/method-sigs target-td) target-method)
                   _             (when-not target-sig
-                                  (throw (ex-info (str "Target method " target-method
-                                                       " not found in " ret-class-sym) {})))]
+                                  (throw (ex-info (str "Target method " target-method " not found in " ret-class-sym) {})))]
               (let [[_ target-java target-params target-return] target-sig
                     new-params (cons 'this (rest target-params))]
-                [[proto-fn target-java new-params target-return]])))
+                ;; proto-name 暂用 target-method（原始 Java 名），后续由 rename 处理
+                [[target-method target-java new-params target-return]])))
           delegate-config)]
     (merge-type-def host-type-def
                     {::spec/type-name ::merge-placeholder
@@ -277,25 +286,31 @@
 (defn build-type-def
   [java-class & {:keys [rename rename-fn only except dangerous setter-danger? delegate custom prefix]
                  :or {rename {} dangerous #{} setter-danger? true delegate [] custom [] prefix nil}}]
-  (let [only      (deep-unquote only)
-        except    (deep-unquote except)
+  (let [raw-only  (deep-unquote only)
+        raw-except (deep-unquote except)
         dangerous (deep-unquote dangerous)
         delegate  (deep-unquote delegate)
         custom    (deep-unquote custom)
         rename    (deep-unquote rename)
+        rename-fn (if (some? rename-fn) rename-fn bean-name->kebab-name)
+        ;; 名称转换函数
+        resolve-name (fn [orig-name]
+                       (let [renamed (or (get rename orig-name) orig-name)]
+                         (if rename-fn (rename-fn renamed) renamed)))
         type-def (resolve-type java-class)
         delegate-entries (normalize-delegate-config java-class delegate)
         type-def (if (seq delegate-entries)
                    (merge-type-def-with-delegates type-def delegate-entries)
                    type-def)
-        type-def (merge-extra-methods type-def [] custom)   ;; 委托已处理，只添加自定义
+        type-def (merge-extra-methods type-def [] custom)
         type-def (rename-methods-in-type-def type-def rename rename-fn)
         type-def (add-prefix-to-type-def type-def prefix)
-        ;; 为 only/except 添加前缀（基于 proto-name）
-        only   (if prefix (map #(symbol (str prefix (name %))) only) only)
-        except (if prefix (map #(symbol (str prefix (name %))) except) except)
-        default-include (nil? only)
-        type-def (filter-methods-in-type-def type-def default-include only except)
+        ;; 转换过滤列表
+        only-seq   (mapv resolve-name (or raw-only []))
+        except-seq (mapv resolve-name (or raw-except []))
+        ;; 决定过滤策略
+        default-include (nil? raw-only)
+        type-def (filter-methods-in-type-def type-def default-include only-seq except-seq)
         type-def (mark-dangerous-in-type-def type-def dangerous :setter-danger? setter-danger?)
         type-def (dedupe-methods type-def)]
     type-def))
@@ -361,12 +376,9 @@
       [proto java params return {:delegate java}])))
 
 (defn delegate-impl-policy [delegate-config]
-  (let [mapping (into {} (map (fn [entry]
-                                (let [proto-fn (first entry)
-                                      getter (second entry)
-                                      target (if (= (count entry) 3) (nth entry 2) proto-fn)]
-                                  [proto-fn {:delegate {:getter getter :method target}}])))
-                      delegate-config)]
+  (let [mapping (into {} (map (fn [[proto-fn getter target-method]]
+                                [proto-fn {:delegate {:getter getter :method target-method}}])
+                              delegate-config))]
     (fn [[proto java params return :as sig] cls]
       (when-let [impl (get mapping proto)]
         [proto java params return impl]))))
@@ -444,7 +456,6 @@
   (let [type-sym (::spec/type-name type-def)
         proto-sym (::spec/protocol-name protocol-def)
         sigs (::spec/method-sigs type-def)
-        ;; 关键修改：将协议方法签名的键统一转为关键字
         proto-method-map (into {} (map (fn [[k v]] [(keyword (name k)) v])
                                        (::spec/protocol-method-sigs protocol-def)))
         clauses (for [[proto java params _ impl wrappers] sigs
@@ -465,7 +476,6 @@
   (let [opts-map (apply hash-map opts)
         java-class-sym (->sym java-class)
         proto-name (->sym (or (:protocol-name opts-map) (derive-protocol-name java-class-sym)))
-        ;; 直接传递整个 opts-map 给 build-type-def，确保 :prefix 等选项生效
         type-def (apply build-type-def java-class-sym (mapcat identity opts-map))
         proto-def (type-def->protocol-def type-def proto-name)
         rename      (deep-unquote (:rename opts-map {}))
@@ -473,12 +483,20 @@
         custom      (deep-unquote (:custom opts-map []))
         wrappers    (deep-unquote (:wrappers opts-map {}))
         delegate-classes (deep-unquote (:delegate-classes opts-map nil))
-        rename-inverse (zipmap (vals rename) (keys rename))
+        rename-fn   (or (:rename-fn opts-map) bean-name->kebab-name)
+        resolve-name (fn [orig-name]
+                       (let [renamed (or (get rename orig-name) orig-name)]
+                         (if rename-fn (rename-fn renamed) renamed)))
+        ;; 委托条目处理（与 build-type-def 中保持一致）
         normalized-delegate (normalize-delegate-config java-class-sym delegate)
-        custom-config (mapv (fn [[k a f]] [(->sym k) a f]) custom)
+        delegate-config (mapv (fn [[target-method getter]]
+                                [(resolve-name target-method) getter target-method])
+                              normalized-delegate)
+        custom-config (mapv (fn [[k a f]] [(resolve-name k) a f]) custom)
+        rename-inverse (zipmap (vals rename) (keys rename))
         policies (merge-impl-policies
                    (custom-impl-policy custom-config)
-                   (delegate-impl-policy normalized-delegate)
+                   (delegate-impl-policy delegate-config)
                    (direct-impl-policy :rename-inverse rename-inverse)
                    (smart-delegate-policy :rename-inverse rename-inverse :delegate-classes delegate-classes))
         type-def (inject-impl-in-type-def type-def policies)

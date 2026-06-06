@@ -41,6 +41,20 @@
 (s/def ::type-def
   (s/keys :req [::type-name ::method-sigs]))
 
+;; 委托条目：[getter] 或 [getter & target-methods]
+(s/def ::delegate-entry
+  (s/or :single-getter       ::single-getter-entry
+        :with-targets        ::with-targets-entry))
+
+(s/def ::single-getter-entry
+  (s/and vector? #(= 1 (count %)) (fn [v] (s/valid? ::getter (first v)))))
+
+(s/def ::with-targets-entry
+  (s/and vector? #(>= (count %) 2)
+         (s/cat :getter ::getter
+                :targets (s/* ::java-method))))
+
+
 ;; 可选配置
 (s/def ::include          (s/coll-of symbol?))
 (s/def ::exclude          (s/coll-of symbol?))
@@ -49,7 +63,6 @@
 (s/def ::rename-fn        fn?)
 (s/def ::danger-set       (s/coll-of symbol? :kind set?))
 (s/def ::setter-danger?   boolean?)
-(s/def ::delegate-entry   (s/or :two (s/tuple symbol? symbol?) :three (s/tuple symbol? symbol? symbol?)))
 (s/def ::delegate-config  (s/coll-of ::delegate-entry :kind vector?))
 (s/def ::custom-entry     (s/tuple symbol? int? symbol?))
 (s/def ::custom-config    (s/coll-of ::custom-entry :kind vector?))
