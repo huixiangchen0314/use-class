@@ -2,7 +2,7 @@
   (:require [clojure.spec.alpha :as s]))
 
 (s/def ::protocol-name symbol?)
-(s/def ::protocol-method-sig (s/tuple ::method-name ::params))
+(s/def ::protocol-method-sig (s/tuple ::method-name ::param-vec))
 (s/def ::protocol-method-sigs (s/coll-of ::protocol-method-sig :kind vector? :min-count 1))
 (s/def ::protocol-def (s/keys :req [::protocol-name ::protocol-method-sigs]))
 
@@ -12,7 +12,7 @@
 (s/def ::getter        symbol?)
 (s/def ::custom-fn     symbol?)
 
-(s/def ::params    (s/coll-of ::type-name :kind vector?))
+(s/def ::param-vec    (s/coll-of ::type-name :kind vector?))
 (s/def ::return    ::type-name)
 
 ;; 实现映射（保持原有规格）
@@ -23,15 +23,16 @@
 (s/def ::impl-custom       (s/keys :req [::custom-fn]))
 (s/def ::impl-map          (s/or :delegate ::impl-delegate :custom ::impl-custom))
 
+(s/def ::wrapper (s/or :fn fn? :sym symbol?))
 ;; 包装器
-(s/def ::wrappers (s/coll-of symbol? :kind vector?))
+(s/def ::wrappers (s/coll-of ::wrapper :kind vector?))
 
 
 ;; 方法签名（动态长度：至少包含 proto, java, params, return）
 (s/def ::method-sig
   (s/cat :proto-name ::method-name
          :java-name ::java-method
-         :params   ::params
+         :params   ::param-vec
          :return   ::return
          :impl     (s/? ::impl-map)       ;; 可选
          :wrappers (s/? ::wrappers)))     ;; 可选
