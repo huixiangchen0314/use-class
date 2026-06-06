@@ -55,13 +55,44 @@
 (s/def ::rename-map       (s/map-of symbol? symbol?))
 (s/def ::rename-fn        fn?)
 (s/def ::danger-set       (s/coll-of symbol? :kind set?))
+
 (s/def ::setter-danger?   boolean?)
-(s/def ::delegate-entry   (s/or :two (s/tuple symbol? symbol?)
-                                :three (s/tuple symbol? symbol? symbol?)))
+;; 委托条目：声明一个协议方法与委托调用之间的映射
+;; 两元素形式：[协议方法名 获取委托对象的方法名]
+;;   协议方法名将被自动推导为目标方法名（需配合命名转换）
+;; 三元素形式：[协议方法名 获取委托对象的方法名 目标方法名]
+;; 委托条目：声明协议方法与委托调用之间的映射关系
+;; 单元素：[getter]                                      委托该 getter 返回类型的所有方法
+;; 两元素：[proto-fn getter]                              委托单个方法，目标方法名同 proto-fn
+;; 三元素：[proto-fn getter target-method]                委托单个方法，显式指定目标方法名
+;; 手动映射：[getter [[proto-fn method] ...]]             委托指定的一组方法，手动指定映射关系
+
+(s/def ::delegate-entry
+  (s/or :single-getter       ::single-getter-entry
+        :two-elements        ::two-elements-entry
+        :three-elements      ::three-elements-entry
+        :manual-mapping      ::manual-mapping-entry))
+
+(s/def ::single-getter-entry
+  (s/and vector? #(= 1 (count %))
+         (fn [v] (s/valid? ::getter (first v)))))
+
+(s/def ::two-elements-entry
+  (s/tuple ::method-name ::getter))
+
+(s/def ::three-elements-entry
+  (s/tuple ::method-name ::getter ::java-method))
+
+(s/def ::manual-mapping-entry
+  (s/and vector? #(= 2 (count %))
+         (s/cat :getter ::getter
+                :mappings (s/coll-of (s/tuple ::method-name ::java-method) :kind vector?))))
+
+
 (s/def ::delegate-config  (s/coll-of ::delegate-entry :kind vector?))
 (s/def ::custom-entry     (s/tuple symbol? int? symbol?))
 (s/def ::custom-config    (s/coll-of ::custom-entry :kind vector?))
-(s/def ::filter fn?)   ;; 自定义过滤谓词，接收方法名符号，返回布尔值
+
 ;; ── 包装器配置 ──
 (s/def ::global-wrappers (s/coll-of symbol? :kind vector?))
 (s/def ::method-wrappers (s/map-of symbol? (s/coll-of symbol? :kind vector?)))
