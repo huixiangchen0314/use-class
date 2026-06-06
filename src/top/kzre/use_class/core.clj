@@ -93,11 +93,8 @@
 
 (defn- method->sig [^Method m]
   (let [jname       (symbol (.getName m))
-        param-types (.getParameterTypes m)
-        params      (->> param-types
-                         (map #(symbol (.getName ^Class %)))
-                         (cons 'this)
-                         vec)
+        arity       (.getParameterCount m)
+        params      (vec (cons 'this (repeatedly arity #(gensym "arg"))))
         return      (symbol (.getName (.getReturnType m)))]
     [jname jname params return]))
 
@@ -508,24 +505,24 @@
 (defn emit-extend-type [type-def protocol-def]
   (let [type-sym (::spec/type-name type-def)
         proto-sym (::spec/protocol-name protocol-def)
-        sigs (::spec/method-sigs type-def)    ;; 原始 params (仅 this)
+        sigs (::spec/method-sigs type-def)                  ;; 原始 sigs (params 未修改)
         proto-method-map (into {} (map (fn [[k v]] [(keyword (name k)) v])
                                        (::spec/protocol-method-sigs protocol-def)))
         clauses
         (for [[proto-fn java orig-params _ impl wrappers] sigs
               :let [proto-keyword (keyword (name proto-fn))
-                    proto-params (get proto-method-map proto-keyword)]  ;; 修改后的 params (可能含 n)
+                    proto-params (get proto-method-map proto-keyword)] ;; 修改后的 params (来自 proto-def)
               :when proto-params
-              :let [this-sym   (first proto-params)        ;; this 符号一致
-                    arg-syms   (rest proto-params)         ;; 包装器额外参数 (如 n)
-                    orig-arg-syms (rest orig-params)       ;; 原始参数 (无额外)
-                    params-vec (vec proto-params)           ;; 方法签名用修改后的
-                    raw-body   (impl-expr impl this-sym orig-arg-syms)  ;; ★ 使用原始参数
-                    inner-fn   `(fn [~this-sym] ~raw-body)   ;; 内部函数只接受 this
+              :let [this-sym   (first proto-params)          ;; this
+                    arg-syms   (rest proto-params)           ;; 修改后的额外参数 (如 m)
+                    orig-arg-syms (rest orig-params)         ;; ★ 原始额外参数 (如 from to)
+                    params-vec (vec proto-params)            ;; extend-type 方法签名 (修改后)
+                    raw-body   (impl-expr impl this-sym orig-arg-syms)  ;; 用原始参数生成调用
+                    inner-fn   `(fn [~this-sym ~@orig-arg-syms] ~raw-body) ;; ★ 内部函数携带原始参数
                     combined   (if (seq wrappers)
                                  `((comp ~@(reverse wrappers)) ~inner-fn)
                                  inner-fn)
-                    body `(~combined ~this-sym ~@arg-syms)] ] ;; 组合调用传入额外参数
+                    body `(~combined ~this-sym ~@arg-syms)]] ;; 调用时传入修改后的参数
           `(~proto-fn ~params-vec ~body))]
     `(extend-type ~type-sym ~proto-sym ~@clauses)))
 
