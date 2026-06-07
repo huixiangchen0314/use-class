@@ -313,13 +313,14 @@
                    type-def)
         type-def (merge-extra-methods type-def [] custom)
         type-def (rename-methods-in-type-def type-def rename rename-fn)
-        type-def (add-prefix-to-type-def type-def prefix)
         ;; 转换过滤列表
         only-seq   (mapv resolve-name (or raw-only []))
         except-seq (mapv resolve-name (or raw-except []))
         ;; 决定过滤策略
         default-include (nil? raw-only)
         type-def (filter-methods-in-type-def type-def default-include only-seq except-seq)
+        ;; 过滤完成后再添加前缀
+        type-def (add-prefix-to-type-def type-def prefix)
         type-def (mark-dangerous-in-type-def type-def dangerous :setter-danger? setter-danger?)
         type-def (dedupe-methods type-def)]
     type-def))
