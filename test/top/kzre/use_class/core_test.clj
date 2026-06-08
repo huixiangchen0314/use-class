@@ -119,18 +119,14 @@
           [method-name params body] (first clauses)]
       (is (= 'get-time method-name))
       (is (= '[this] params))
-      ;; body = (((comp my-wrapper) (fn [this] ...)) this)
+      ;; body 的结构现在是 ((my-wrapper (fn [this] ...)) this)
       (is (seq? body))
       (is (= 2 (count body)))
-      (let [comb-call (first body)   ; ((comp my-wrapper) (fn [this] ...))
-            this-sym  (second body)] ; this
-        ;; comb-call 第一个元素是 (comp my-wrapper)
-        (let [comp-expr (first comb-call)]
-          (is (seq? comp-expr))
-          (is (= 'clojure.core/comp (first comp-expr)))   ; comp 符号
-          (is (= 'my-wrapper (second comp-expr))))        ; my-wrapper 符号
-        ;; comb-call 第二个元素是内部匿名函数 (fn [this] ...)
-        (let [inner-fn (second comb-call)]
+      (let [wrapper-call (first body)   ;; (my-wrapper (fn [this] ...))
+            this-sym      (second body)] ;; this
+        (is (seq? wrapper-call))
+        (is (= 'my-wrapper (first wrapper-call)))    ;; 直接调用包装器
+        (let [inner-fn (second wrapper-call)]        ;; (fn [this] ...)
           (is (seq? inner-fn))
           (is (= 'clojure.core/fn (first inner-fn)))
           (is (= '[this] (second inner-fn)))
