@@ -94,7 +94,10 @@
 (defn- method->sig [^Method m]
   (let [jname       (symbol (.getName m))
         arity       (.getParameterCount m)
-        params      (vec (cons 'this (repeatedly arity #(gensym "arg"))))
+        varargs?    (.isVarArgs m)
+        params      (if varargs?
+                      (vec (concat ['this] (repeatedly (dec arity) #(gensym "arg")) ['& (gensym "rest")]))
+                      (vec (cons 'this (repeatedly arity #(gensym "arg")))))
         return      (symbol (.getName (.getReturnType m)))]
     [jname jname params return]))
 
@@ -476,12 +479,10 @@
            (filter #(= "invoke" (.getName %)))
            (map #(count (.getParameterTypes %)))
            (reduce max 0)))))
-
 (defn apply-wrapper-args [method-sig]
   (let [wrappers (nth method-sig 5 nil)]
     (if (sequential? wrappers)
-      (let [;; 解析每个包装器为实际函数
-            resolve-wrapper (fn [w]
+      (let [resolve-wrapper (fn [w]
                               (cond
                                 (symbol? w) (some-> (ns-resolve *ns* w) deref)
                                 (var? w)    @w
@@ -489,15 +490,21 @@
                                 :else       nil))
             wrapper-fns (map resolve-wrapper wrappers)]
         (if (every? fn? wrapper-fns)
-          ;; 组合包装器链：从内向外应用包装器到一个占位函数
           (try
             (let [placeholder (fn [& args])
                   final-fn    (reduce (fn [f w] (w f)) placeholder wrapper-fns)
-                  param-count (infer-param-count final-fn)]
-              (if (> param-count 0)   ;; 至少有一个 this
-                (let [this-sym (first (nth method-sig 2))
-                      extra-syms (repeatedly (dec param-count) #(gensym "arg"))]
-                  (assoc method-sig 2 (vec (cons this-sym extra-syms))))
+                  param-count (infer-param-count final-fn)
+                  orig-params (nth method-sig 2)
+                  ;; 计算原始参数中的固定参数个数（剔除 `&` 及后面的变参名）
+                  fixed-count (count (take-while #(not= '& %) orig-params))]
+              (if (> param-count 0)
+                (if (= param-count fixed-count)
+                  ;; 参数个数匹配，保留原始签名（包括变参信息）
+                  method-sig
+                  ;; 参数个数不匹配，生成全新的固定参数向量（没有变参）
+                  (let [this-sym (first orig-params)
+                        extra-syms (repeatedly (dec param-count) #(gensym "arg"))]
+                    (assoc method-sig 2 (vec (cons this-sym extra-syms)))))
                 method-sig))
             (catch Exception _ method-sig))
           method-sig))
