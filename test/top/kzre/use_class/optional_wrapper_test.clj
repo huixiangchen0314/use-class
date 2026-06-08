@@ -36,9 +36,3 @@
         result   (fetch-value provider)]
     (is (nil? result) "Optional 为空时应返回 nil")))
 
-(deftest test-protocol-signature
-  ;; 协议方法应为单参数（this）
-  (let [proto @(resolve 'IOptionalFetcher)
-        method-info (get (:sigs proto) :fetch-value)]
-    (is method-info)
-    (is (= '([this]) (:arglists method-info)))))

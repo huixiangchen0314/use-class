@@ -1,92 +1,25 @@
 (ns top.kzre.use-class.core
   (:require
     [clojure.string :as str]
-    [clojure.walk :as walk]
-    [top.kzre.use-class.spec :as spec])
+    [top.kzre.use-class.spec :as spec]
+    [top.kzre.use-class.util :as util])
   (:import
-    [java.lang.reflect Method Modifier]))
+    (java.lang.reflect Method Modifier)))
 
-(defn bean-name->kebab-name
-  "将 Java 方法名符号转为 Clojure kebab-case 符号，保留 get/set/is 前缀。
-   例如：getTime → get-time，setTime → set-time，isReady → is-ready。"
-  [method-sym]
-  (let [name   (name method-sym)
-        [prefix body]
-        (cond
-          (re-find #"^get[A-Z]" name) ["get" (subs name 3)]
-          (re-find #"^set[A-Z]" name) ["set" (subs name 3)]
-          (re-find #"^is[A-Z]" name)  ["is" (subs name 2)]
-          :else                        [nil name])
-        hyphenated (-> body
-                       (str/replace #"([A-Z])" #(str "-" (.toLowerCase (second %))))
-                       (str/replace #"^-" ""))
-        full (str (when prefix (str prefix "-")) hyphenated)]
-    (symbol full)))
+(def ^:const sig-proto     0)  ; 协议方法名
+(def ^:const sig-java      1)  ; 原始 Java 方法名
+(def ^:const sig-params    2)  ; 参数向量（含 this）
+(def ^:const sig-return    3)  ; 返回类型
+(def ^:const sig-impl      4)  ; 实现策略
+(def ^:const sig-wrappers  5)  ; 包装器列表
 
-(defn bean-name->kebab-name-strip
-  "将 Java 方法名符号转为 Clojure kebab-case 符号，并去除 get/set/is 前缀。
-   例如：getTime → time，setTime → set-time，isReady → ready?。"
-  [method-sym]
-  (let [name   (name method-sym)
-        [prefix body bang?]
-        (cond
-          (re-find #"^get[A-Z]" name) [nil (subs name 3) false]
-          (re-find #"^set[A-Z]" name) ["set" (subs name 3) true]
-          (re-find #"^is[A-Z]" name)  [nil (str (subs name 2) "?") false]
-          :else                        [nil name false])
-        hyphenated (-> body
-                       (str/replace #"([A-Z])" #(str "-" (.toLowerCase (second %))))
-                       (str/replace #"^-" ""))
-        full (str (when prefix (str prefix "-")) hyphenated (when bang? "!"))]
-    (symbol full)))
 
-;; ── 常量 ──
+;; ================ Resolve Java Type ==================================
 (defonce ^:private object-method-names
          (->> (.getMethods Object)
               (map #(.getName ^Method %))
               set))
 
-(defn ->sym
-  [x]
-  (cond
-    (symbol? x) x
-    (keyword? x) (symbol (name x))
-    (string? x) (symbol x)
-    (and (seq? x) (= (first x) 'quote) (= (count x) 2))
-    (->sym (second x))
-    :else (throw (IllegalArgumentException. (str "无法转换为符号: " x)))))
-
-(defn- kebab->camel-safe
-  [method-sym]
-  (let [s (name method-sym)
-        parts (str/split s #"-")]
-    (if (= 1 (count parts))
-      method-sym
-      (let [prefix (first parts)
-            rest-words (rest parts)]
-        (if (#{"get" "set" "is"} prefix)
-          (symbol (str prefix (apply str (map str/capitalize rest-words))))
-          nil)))))
-
-(defn- unquote-form
-  [form]
-  (if (and (seq? form) (= (first form) 'quote) (= (count form) 2))
-    (second form)
-    form))
-
-(defn- deep-unquote
-  [coll]
-  (walk/postwalk unquote-form coll))
-
-(defn- java-arity [params]
-  "返回 Java 方法所需的参数个数（不包括 this）。变参算作一个参数。"
-  (let [without-this (rest params)
-        fixed (take-while #(not= '& %) without-this)
-        has-var? (some '#{&} without-this)]
-    (+ (count fixed) (if has-var? 1 0))))
-
-
-;; ── 步骤 1：解析 Java 类型 ──
 (defn- extract-methods [cls]
   (.getMethods cls))
 
@@ -99,15 +32,13 @@
 (defn- filter-static-methods [methods]
   (remove static-method? methods))
 
-(defn- method->sig [^Method m]
-  (let [jname       (symbol (.getName m))
+(defn- java-method->method-sig [^Method m]
+  (let [java-method       (symbol (.getName m))
         arity       (.getParameterCount m)
-        varargs?    (.isVarArgs m)
-        params      (if varargs?
-                      (vec (concat ['this] (repeatedly (dec arity) #(gensym "arg")) ['& (gensym "rest")]))
-                      (vec (cons 'this (repeatedly arity #(gensym "arg")))))
-        return      (symbol (.getName (.getReturnType m)))]
-    [jname jname params return]))
+        param-vec      (vec (cons 'this (repeatedly arity #(gensym "arg"))))
+        return-sym      (symbol (.getName (.getReturnType m)))]
+    [java-method                                            ;; 暂且用 java名称占位
+     java-method param-vec return-sym]))
 
 (defn resolve-type
   "解析 Java 类型。接受：
@@ -117,21 +48,20 @@
    返回包含 ::spec/type-name 和 ::spec/method-sigs 的 map。"
   [type-spec]
   (let [cls (cond
-              (class? type-spec) type-spec                         ; 已经是类
-              (symbol? type-spec) (or (resolve type-spec)          ; 直接解析
-                                      (resolve (symbol (str "java.lang." (name type-spec))))) ; java.lang 回退
+              (class? type-spec) type-spec
+              (symbol? type-spec) (or (resolve type-spec)
+                                      (throw (IllegalArgumentException. (str "Symbol cannot be resolved: " type-spec))))
               (string? type-spec) (resolve-type (symbol type-spec)) ; 字符串转符号递归
               :else (throw (IllegalArgumentException. (str "无效的类型参数: " type-spec))))]
     (when-not cls
-      (throw (IllegalArgumentException. (str "无法解析的 Java 类型: " type-spec))))
-    ;; 使用类全限定名作为 type-name，以便后续可靠使用
-    (let [full-name (symbol (.getName ^Class cls))]
-      {::spec/type-name full-name
+      (throw (IllegalArgumentException. (str "Dont known how to handle type:" type-spec))))
+    (let [class-name-sym (symbol (.getName ^Class cls))]
+      {::spec/type-name class-name-sym
        ::spec/method-sigs (vec (->> cls
                                     extract-methods
                                     filter-object-methods
                                     filter-static-methods
-                                    (mapv method->sig)))})))
+                                    (mapv java-method->method-sig)))})))
 
 ;; ── 重命名 ──
 (defn rename-methods-in-type-def
@@ -158,27 +88,34 @@
     type-def))
 
 ;; ── 过滤 ──
+
+(defn normalize-filter-entries
+  "将用户提供的过滤条目统一为 `[name arity]` 向量序列。
+   每个条目可以是一个符号（仅按名称过滤，arity 为 nil），
+   或一个 `[name arity]` 向量（按名称和参数个数过滤）。
+   返回一个向量，其中每个元素为 `[name arity]`。"
+  [entries]
+  (mapv (fn [entry]
+          (if (vector? entry)
+            [(first entry) (second entry)]
+            [entry nil]))
+        entries))
+
 (defn filter-methods-in-type-def
-  [type-def default-include include exclude]
-  (let [parse-entry (fn [entry]
-                      (if (vector? entry)
-                        [(first entry) (second entry)]
-                        [entry nil]))
-        include-specs (map parse-entry include)
-        exclude-specs (map parse-entry exclude)
-        matches? (fn [proto arity specs]
-                   (some (fn [[name wanted-arity]]
-                           (and (= name proto)
-                                (or (nil? wanted-arity)
-                                    (= arity wanted-arity))))
-                         specs))
-        pred (if default-include
-               (fn [proto arity] (not (matches? proto arity exclude-specs)))
-               (fn [proto arity] (matches? proto arity include-specs)))]
+  [type-def default-include include-norm exclude-norm]
+  (let [
+        matches? (fn [specs java-name arity]
+                   (some (fn [[n a]]
+                           (and (= n java-name)
+                                (or (nil? a) (= a arity))))
+                         specs))]
     (update type-def ::spec/method-sigs
             (fn [sigs]
-              (filterv (fn [[proto _ params]]
-                         (pred proto (java-arity params)))
+              (filterv (fn [[_ java params]]
+                         (let [arity (dec (count params))]
+                           (if default-include
+                             (not (matches? exclude-norm java arity))
+                             (matches? include-norm java arity))))
                        sigs)))))
 
 ;; ── 危险标记 ──
@@ -199,13 +136,32 @@
                   sigs))))
 
 ;; ── 去重 ──
+
+(defn- dedupe-method-sigs
+  "给定方法名和它的签名列表，根据 `explicit-arities` 决定保留哪些签名。
+   - 若方法名在 `explicit-arities` 中，保留所有参数个数匹配的签名（支持重载）。
+   - 否则，只保留参数个数最大的一个签名。"
+  [proto sigs explicit-arities]
+  (if-let [arities (get explicit-arities proto)]
+    (filter (fn [[_ _ params]]
+              (contains? arities (dec (count params))))
+            sigs)
+    (let [max-sig (reduce (fn [s1 s2]
+                            (if (> (dec (count (nth s2 2)))
+                                   (dec (count (nth s1 2))))
+                              s2
+                              s1))
+                          (first sigs)
+                          (rest sigs))]
+      [max-sig])))
+
 (defn dedupe-methods [type-def]
   (update type-def ::spec/method-sigs
           (fn [sigs]
             (vec (vals (reduce (fn [m [proto java params return :as sig]]
-                                 (let [arity (java-arity params)]
+                                 (let [arity (dec (count params))]
                                    (if-let [existing (get m proto)]
-                                     (let [existing-arity (java-arity (nth existing 2))]  ; ← 修正这里
+                                     (let [existing-arity (dec (count (nth existing 2)))]
                                        (if (> arity existing-arity)
                                          (assoc m proto sig)
                                          m))
@@ -214,22 +170,16 @@
                                sigs))))))
 
 ;; ── 合并额外方法 ──
-(defn merge-extra-methods [type-def delegate-config custom-config]
-  (let [existing-names (set (map first (::spec/method-sigs type-def)))
-        extra-sigs
-        (concat
-          (for [entry delegate-config
-                :let [proto-fn (->sym (first entry))]
-                :when (not (contains? existing-names proto-fn))]
-            [proto-fn proto-fn '[this] nil])
-          (for [[proto-fn arity custom-fn & [param-types]] custom-config
-                :let [proto-fn (->sym proto-fn)]
-                :when (not (contains? existing-names proto-fn))]
-            (let [params (if param-types
-                           (into ['this] param-types)
-                           (into ['this] (repeat (dec arity) 'java.lang.Object)))]
-              [proto-fn proto-fn params nil])))]
-    (update type-def ::spec/method-sigs into extra-sigs)))
+(defn merge-type-def-with-custom-methods
+  "Merges user-defined custom method signatures into the type-def."
+  [type-def custom-config]
+  (update type-def ::spec/method-sigs
+          into (for [[proto-fn arity custom-fn & [param-types]] custom-config
+                     :let [proto-fn (util/->sym proto-fn)
+                           params (if param-types
+                                    (into ['this] param-types)
+                                    (into ['this] (repeat (dec arity) 'java.lang.Object)))]]
+                 [proto-fn proto-fn params nil])))
 
 ;; ── 合并 type-def ──
 (defn merge-type-def
@@ -257,7 +207,7 @@
   (let [candidates (filter #(= (second %) method-name) sigs)
         _ (when (empty? candidates)
             (throw (ex-info (str "未找到方法 " method-name) {})))
-        groups (group-by (fn [[_ _ params _]] (java-arity params)) candidates)
+        groups (group-by (fn [[_ _ params _]] (dec (count params))) candidates)
         max-arity (apply max (keys groups))
         top-group (get groups max-arity)]
     (first top-group)))
@@ -277,10 +227,10 @@
   (mapcat
     (fn [entry]
       (let [entry (if (and (seq? entry) (= (first entry) 'quote) (= (count entry) 2))
-                    (->sym entry)
+                    (util/->sym entry)
                     entry)
             entry (if (symbol? entry) [entry] entry)
-            entry (mapv ->sym entry)
+            entry (mapv util/->sym entry)
             getter (first entry)
             target-methods (rest entry)]
         (if (seq target-methods)
@@ -314,48 +264,71 @@
                     {::spec/type-name ::merge-placeholder
                      ::spec/method-sigs (vec extra-sigs)})))
 
-;; ── 构建最终的 type-def ──
+(defn- ensure-explicit-arities
+  "根据用户通过 `:only` 明确指定的参数个数（arity），向 type-def 中添加缺失的方法签名。"
+  [type-def only-entries]
+  (let [arities-map (reduce (fn [m [name arity]]
+                              (if arity
+                                (update m name (fnil conj #{}) arity)
+                                m))
+                            {}
+                            only-entries)]
+    (if (seq arities-map)
+      (update type-def ::spec/method-sigs
+              (fn [sigs]
+                (let [by-name (group-by first sigs)]
+                  (mapcat (fn [[method arities]]
+                            (let [existing (get by-name method [])
+                                  existing-arities (set (map (comp dec count #(nth % 2)) existing))]
+                              (concat existing
+                                      (for [a arities
+                                            :when (not (contains? existing-arities a))]
+                                        (let [template (first existing)
+                                              java-name (second template)
+                                              params (vec (cons 'this (repeatedly a #(gensym "arg"))))]
+                                          [method java-name params (nth template 3 nil)])))))
+                          arities-map))))
+      type-def)))
+
 (defn build-type-def
-  [java-class & {:keys [rename rename-fn only except dangerous setter-danger? delegate custom prefix]
+  [java-class-sym & {:keys [only except
+                        rename rename-fn dangerous setter-danger? prefix
+                        delegate custom ]
                  :or {rename {} dangerous #{} setter-danger? true delegate [] custom [] prefix nil}}]
-  (let [raw-only  (deep-unquote only)
-        raw-except (deep-unquote except)
-        dangerous (deep-unquote dangerous)
-        delegate  (deep-unquote delegate)
-        custom    (deep-unquote custom)
-        rename    (deep-unquote rename)
-        rename-fn (if (some? rename-fn) rename-fn bean-name->kebab-name)
-        ;; 名称转换函数
-        resolve-name (fn [orig-name]
-                       (let [renamed (or (get rename orig-name) orig-name)]
-                         (if rename-fn (rename-fn renamed) renamed)))
-        type-def (resolve-type java-class)
-        delegate-entries (normalize-delegate-config java-class delegate)
+  (let [only  (util/deep-unquote only)
+        except (util/deep-unquote except)
+        only-entries   (normalize-filter-entries (or only []))
+        except-entries (normalize-filter-entries (or except []))
+        dangerous (util/deep-unquote dangerous)
+        delegate  (util/deep-unquote delegate)
+        custom    (util/deep-unquote custom)
+        rename    (util/deep-unquote rename)
+        rename-fn (or rename-fn util/bean-name->kebab-name)
+        ;; resolve
+        type-def (resolve-type java-class-sym)
+        _ (println "After resolve, methods:" (mapv first (::spec/method-sigs type-def)))
+        delegate-entries (normalize-delegate-config java-class-sym delegate)
         type-def (if (seq delegate-entries)
                    (merge-type-def-with-delegates type-def delegate-entries)
                    type-def)
-        type-def (merge-extra-methods type-def [] custom)
+        _ (println "After delegate merge, methods:" (mapv first (::spec/method-sigs type-def)))
+        type-def (merge-type-def-with-custom-methods type-def custom)
+        _ (println "After custom merge, methods:" (mapv first (::spec/method-sigs type-def)))
+        ;; filter
+        default-include (nil? only)
+        _ (println "Filtering: default-include =" default-include ", only =" only ", except =" except)
+        type-def (filter-methods-in-type-def type-def default-include only-entries except-entries)
+        _ (println "After filter, methods:" (mapv first (::spec/method-sigs type-def)))
+        type-def (dedupe-methods type-def)
+        _ (println "After dedupe, methods:" (mapv first (::spec/method-sigs type-def)))
+        type-def (ensure-explicit-arities type-def only-entries)
+        _ (println "After ensure-explicit-arities , methods:" (mapv first (::spec/method-sigs type-def)))
+        ;; rename
         type-def (rename-methods-in-type-def type-def rename rename-fn)
-        ;; 转换过滤列表
-        ;; 处理 :only 和 :except，支持向量 [method-name arity]
-        resolved-only (mapv (fn [entry]
-                              (if (vector? entry)
-                                (let [[name arity] entry]
-                                  [(resolve-name name) arity])
-                                (resolve-name entry)))
-                            (or raw-only []))
-        resolved-except (mapv (fn [entry]
-                                (if (vector? entry)
-                                  (let [[name arity] entry]
-                                    [(resolve-name name) arity])
-                                  (resolve-name entry)))
-                              (or raw-except []))
-        default-include (nil? raw-only)
-        type-def (filter-methods-in-type-def type-def default-include resolved-only resolved-except)
-        ;; 过滤完成后再添加前缀
+        _ (println "After rename, methods:" (mapv first (::spec/method-sigs type-def)))
         type-def (add-prefix-to-type-def type-def prefix)
         type-def (mark-dangerous-in-type-def type-def dangerous :setter-danger? setter-danger?)
-        type-def (dedupe-methods type-def)]
+        ]
     type-def))
 
 ;; ── 协议定义生成 ──
@@ -374,7 +347,7 @@
 
 (defn type-def->protocol-def [type-def proto-name]
   (let [sigs (filter-core-conflicts (::spec/method-sigs type-def))]
-    {::spec/protocol-name (->sym proto-name)
+    {::spec/protocol-name (util/->sym proto-name)
      ::spec/protocol-method-sigs
      (mapv (fn [sig]
              (let [proto (first sig)
@@ -383,15 +356,24 @@
                [proto params]))
            sigs)}))
 
-(defn emit-defprotocol
-  [protocol-def]
-  (let [proto-name (::spec/protocol-name protocol-def)
-        sigs (::spec/protocol-method-sigs protocol-def)]
-    `(defprotocol ~proto-name
-       ~@(for [[name param-vec] sigs]
-           `(~name ~param-vec)))))
+(defn- group-method-sigs-by-name
+  "将 [[method params] ...] 转换为 {method [params ...]}，保持原顺序。"
+  [flat-sigs]
+  (reduce (fn [m [name params]]
+            (update m name (fnil conj []) params))
+          {}
+          flat-sigs))
 
-(defn derive-protocol-name
+(defn emit-defprotocol [protocol-def]
+  (let [proto-name (::spec/protocol-name protocol-def)
+        sigs (::spec/protocol-method-sigs protocol-def)
+        grouped (group-method-sigs-by-name sigs)]        ;; {method [params...]}
+    `(defprotocol ~proto-name
+       ~@(mapcat (fn [[method paramlists]]
+                   `((~method ~@paramlists)))             ;; (method [p1] [p2] ...)
+                 grouped))))
+
+(defn default-proto-sym
   [class-sym]
   (let [simple (-> (str class-sym)
                    (str/replace #"^.*\." "")
@@ -401,8 +383,8 @@
 ;; ── 顶层宏：生成协议 ──
 (defmacro defprotocol-from-type [java-class & opts]
   (let [opts-map (apply hash-map opts)
-        java-class-sym (->sym java-class)
-        proto-name (->sym (or (:protocol-name opts-map) (derive-protocol-name java-class-sym)))
+        java-class-sym (util/->sym java-class)
+        proto-name (util/->sym (or (:protocol-name opts-map) (default-proto-sym java-class-sym)))
         type-def (apply build-type-def java-class-sym (mapcat identity opts-map))
         proto-def (type-def->protocol-def type-def proto-name)]
     (emit-defprotocol proto-def)))
@@ -416,7 +398,7 @@
 
 (defn direct-impl-policy [& {:keys [rename-inverse]}]
   (fn [[proto java params return :as sig] cls]
-    (when (find-method-by-name-and-arity cls java (java-arity params))
+    (when (find-method-by-name-and-arity cls java (dec (count params)))
       [proto java params return {:delegate java}])))
 
 (defn delegate-impl-policy [delegate-config]
@@ -436,7 +418,7 @@
 (defn smart-delegate-policy [& {:keys [rename-inverse delegate-classes]}]
   (fn [[proto java params return :as sig] cls]
     (let [java-name java
-          arity (java-arity params)
+          arity (dec (count params))
           getters (if delegate-classes
                     (filter #(contains? delegate-classes (.getReturnType ^Method %))
                             (.getMethods cls))
@@ -487,19 +469,36 @@
           inner-expr
           wrappers))
 
-(defn wrap-impl-in-type-def
-  [type-def wrappers-config]
+
+(defn- resolve-wrappers
+  "从方法包装器配置中解析出应用于指定方法和参数个数的包装器列表。
+   `method-wrappers` 是 :methods 部分的 map，键可以是符号（方法名，匹配所有 arity）或
+   向量 [方法名 参数个数]（精确匹配）。"
+  [method-wrappers java-method arity]
+  (reduce-kv (fn [acc k wrappers]
+               (if (and (vector? k)
+                        (= (first k) java-method)
+                        (= (second k) arity))
+                 (vec (concat acc wrappers))         ;; 精确匹配
+                 (if (and (symbol? k) (= k java-method))
+                   (vec (concat acc wrappers))       ;; 符号匹配所有 arity
+                   acc)))
+             []
+             method-wrappers))
+
+(defn wrap-impl-in-type-def [type-def wrappers-config]
   (let [global-wrappers (get wrappers-config :global [])
         method-wrappers (get wrappers-config :methods {})]
     (update type-def ::spec/method-sigs
             (fn [sigs]
               (mapv (fn [sig]
                       (let [java-method (second sig)
-                            wrappers (vec (concat global-wrappers (get method-wrappers java-method [])))]
-                        (conj (vec sig) wrappers)))
+                            arity       (dec (count (nth sig 2)))
+                            specific-wrappers (resolve-wrappers method-wrappers java-method arity)
+                            all-wrappers (vec (concat global-wrappers specific-wrappers))]
+                        (conj (vec sig) all-wrappers)))
                     sigs)))))
 
-;; ── 包装器签名推断（只保留一份 infer-param-count）──
 (defn- infer-param-count
   "反射获取函数对象的参数最大个数。"
   [f]
@@ -509,96 +508,158 @@
            (filter #(= "invoke" (.getName %)))
            (map #(count (.getParameterTypes %)))
            (reduce max 0)))))
-
-(defn- index-of [coll x]
-  (first (keep-indexed #(when (= %2 x) %1) coll)))
-
 (defn apply-wrapper-args [method-sig]
   (let [wrappers (nth method-sig 5 nil)]
+    (println "[apply-wrapper-args] wrappers:" wrappers)
     (if (sequential? wrappers)
-      (let [resolve-wrapper (fn [w]
-                              (cond
-                                (symbol? w) (some-> (ns-resolve *ns* w) deref)
-                                (var? w)    @w
-                                (fn? w)     w
-                                :else       nil))
-            wrapper-fns (map resolve-wrapper wrappers)]
+      (let [wrapper-fns (map util/->fn wrappers)]
+        (println "[apply-wrapper-args] resolved fns:" wrapper-fns)
         (if (every? fn? wrapper-fns)
           (try
-            (let [placeholder (fn [& args])
-                  final-fn    (reduce (fn [f w] (w f)) placeholder wrapper-fns)
-                  param-count (infer-param-count final-fn)
-                  this-sym    (first (nth method-sig 2))]
-              (if (> param-count 0)
-                ;; 尝试从包装器的元数据获取返回函数的 arglists
-                (if-let [meta-arglists (:arglists (meta (last wrapper-fns)))]
-                  ;; 有元数据：提取第二个向量（返回函数的参数）
-                  (if-let [returned-args (second meta-arglists)]  ;; ★ 改为 second
-                    (let [extra-args (rest returned-args)  ; 跳过 this
-                          amp-idx  (index-of (vec extra-args) '&)]
-                      (if (pos? amp-idx)
-                        ;; 变参声明
-                        (let [fixed (take amp-idx extra-args)
-                              vararg (drop (inc amp-idx) extra-args)]
-                          (assoc method-sig 2 (vec (concat [this-sym] fixed ['&] vararg))))
-                        ;; 固定参数
-                        (assoc method-sig 2 (vec (cons this-sym extra-args)))))
-                    method-sig)
-                  ;; 无元数据：反射生成固定参数（不保留原始变参）
-                  (let [extra-syms (repeatedly (dec param-count) #(gensym "arg"))]
-                    (assoc method-sig 2 (vec (cons this-sym extra-syms)))))
-                method-sig))
-            (catch Exception _ method-sig))
+            ;; 修复 1: placeholder 必须有函数体
+            (let [placeholder (fn [& _] nil)
+                  combined-fn (reduce (fn [f w] (w f)) placeholder wrapper-fns)
+                  _ (println "[apply-wrapper-args] combined-fn class:" (class combined-fn))
+                  _ (println "[apply-wrapper-args] combined-fn meta:" (meta combined-fn))
+                  this-sym (first (nth method-sig 2))]
+              ;; 1) 优先从组合后函数的元数据获取
+              (if-let [combined-meta (:arglists (meta combined-fn))]
+                (do
+                  (println "[apply-wrapper-args] Using combined-fn meta")
+                  (let [returned-args (or (second combined-meta) (first combined-meta))]
+                    (if returned-args
+                      (let [extra-args (rest returned-args)
+                            amp-idx (util/index-of (vec extra-args) '&)]
+                        (println "[apply-wrapper-args] extra-args:" extra-args " amp-idx:" amp-idx)
+                        (if (pos? amp-idx)
+                          (let [fixed (take amp-idx extra-args)
+                                vararg (drop (inc amp-idx) extra-args)]
+                            (println "[apply-wrapper-args] -> varargs:" fixed '& vararg)
+                            (assoc method-sig 2 (vec (concat [this-sym] fixed ['&] vararg))))
+                          (let [new-params (vec (cons this-sym extra-args))]
+                            (println "[apply-wrapper-args] -> fixed params:" new-params)
+                            (assoc method-sig 2 new-params))))
+                      method-sig)))
+                ;; 2) 无组合元数据 → 尝试最后一个包装器的元数据
+                (do
+                  (println "[apply-wrapper-args] No combined meta, trying last wrapper meta")
+                  (if-let [last-meta (:arglists (meta (last wrapper-fns)))]
+                    (do
+                      (println "[apply-wrapper-args] Using last wrapper meta")
+                      (let [returned-args (or (second last-meta) (first last-meta))]
+                        (if returned-args
+                          (let [extra-args (rest returned-args)
+                                amp-idx (util/index-of (vec extra-args) '&)]
+                            (println "[apply-wrapper-args] extra-args:" extra-args " amp-idx:" amp-idx)
+                            (if (pos? amp-idx)
+                              (let [fixed (take amp-idx extra-args)
+                                    vararg (drop (inc amp-idx) extra-args)]
+                                (println "[apply-wrapper-args] -> varargs from last wrapper:" fixed '& vararg)
+                                (assoc method-sig 2 (vec (concat [this-sym] fixed ['&] vararg))))
+                              (let [new-params (vec (cons this-sym extra-args))]
+                                (println "[apply-wrapper-args] -> fixed params from last wrapper:" new-params)
+                                (assoc method-sig 2 new-params)))))
+                        method-sig)))
+                  ;; 3) 反射推断
+                  (do
+                    (println "[apply-wrapper-args] Falling back to reflection")
+                    (let [param-count (infer-param-count combined-fn)]
+                      (println "[apply-wrapper-args] inferred param-count:" param-count)
+                      (if (> param-count 0)
+                        (let [extra-syms (repeatedly (dec param-count) #(gensym "arg"))]
+                          (println "[apply-wrapper-args] -> reflected params:" (cons this-sym extra-syms))
+                          (assoc method-sig 2 (vec (cons this-sym extra-syms))))
+                        method-sig))))))
+            ;; 修复 2: 捕获异常，安全回退到原始签名
+            (catch Exception e
+              (println "[apply-wrapper-args] Exception caught:" (.getMessage e))
+              method-sig))
+          ;; wrapper-fns 中不全是函数，直接返回
           method-sig))
       method-sig)))
-(defn emit-extend-type [type-def protocol-def]
+
+(defn expand-method-sigs
+  "对协议方法签名列表进行重载展开。
+   - sigs            : [[method-name params] ...] （已包含包装器调整后的参数）
+   - explicit-arities: #{method-name ...} 用户显式指定了 arity 的方法，跳过展开
+   - varargs-max     : 默认最大额外参数个数
+   - varargs-per     : {method-name max-n} 按方法覆盖的最大额外参数个数
+   返回展开后的扁平列表，可能含有同一方法名的多个签名。"
+  [sigs explicit-arities varargs-max varargs-per]
+  (mapcat
+    (fn [[method params]]
+      (if (or (contains? explicit-arities method)
+              (not (some '#{&} params)))
+        ;; 用户已指定 arity 或非变参：保持原样
+        [[method params]]
+        ;; 变参方法且非显式：展开为 0..max-n 个固定重载
+        (let [fixed      (take-while #(not= '& %) (rest params))
+              this-sym   (first params)
+              max-n      (get varargs-per method varargs-max)]
+          (for [extra (range (inc max-n))]
+            (let [extra-syms (repeatedly extra #(gensym "arg"))]
+              [method (vec (cons this-sym (concat fixed extra-syms)))])))))
+    sigs))
+
+(defn emit-extend-type [type-def proto-sym proto-params-list]
   (let [type-sym (::spec/type-name type-def)
-        proto-sym (::spec/protocol-name protocol-def)
-        sigs (::spec/method-sigs type-def)
-        proto-method-map (into {} (map (fn [[k v]] [(keyword (name k)) v])
-                                       (::spec/protocol-method-sigs protocol-def)))
+        sigs     (::spec/method-sigs type-def)          ;; 原始签名（每个方法一条）
+        ;; 按协议方法名分组，每个方法对应多个参数向量（来自 proto-params-list）
+        grouped  (reduce (fn [m [sig params]]
+                           (let [method-name (first sig)]
+                             (update m method-name (fnil conj []) [sig params])))
+                         {}
+                         (map vector sigs proto-params-list))
         clauses
-        (for [[proto-fn java orig-params _ impl wrappers] sigs
-              :let [proto-keyword (keyword (name proto-fn))
-                    proto-params (get proto-method-map proto-keyword)]
-              :when proto-params
-              :let [this-sym   (first proto-params)
-                    arg-syms   (rest proto-params)
-                    orig-arg-syms (rest orig-params)
-                    params-vec (vec proto-params)
-                    ;; 处理原始参数中的变参，生成正确的 Java 调用
-                    raw-body (let [amp (some '#{&} orig-arg-syms)
-                                   fixed (take-while #(not= '& %) orig-arg-syms)
-                                   vararg (when amp (last orig-arg-syms))]
-                               (if amp
-                                 `(. ~this-sym ~java ~@fixed (into-array Object ~vararg))
-                                 `(. ~this-sym ~java ~@orig-arg-syms)))
-                    inner-fn   `(fn [~this-sym ~@orig-arg-syms] ~raw-body)
-                    combined   (if (seq wrappers)
-                                 (reduce (fn [acc w] `(~w ~acc)) inner-fn wrappers)
-                                 inner-fn)
-                    amp-idx (index-of (vec arg-syms) '&)
-                    fixed-args (if amp-idx (take amp-idx arg-syms) arg-syms)
-                    vararg-sym (when amp-idx (nth arg-syms (inc amp-idx) nil))
-                    body (if vararg-sym
-                           `(apply ~combined ~this-sym ~@fixed-args ~vararg-sym)  ;; ★ 关键修改
-                           `(~combined ~this-sym ~@arg-syms))]]
-          `(~proto-fn ~params-vec ~body))]
+        (for [[method-name overloads] grouped
+              :let [overload-clauses
+                    (for [[sig adjusted-params] overloads
+                          :let [[_ java orig-params _ impl wrappers] sig
+                                this-sym   (first adjusted-params)
+                                arg-syms   (rest adjusted-params)
+                                orig-arg-syms (rest orig-params)
+                                params-vec (vec adjusted-params)
+                                raw-body   (impl-expr impl this-sym orig-arg-syms)
+                                inner-fn   `(fn [~this-sym ~@orig-arg-syms] ~raw-body)
+                                combined   (reduce (fn [acc w] `(~w ~acc)) inner-fn wrappers)
+                                body       `(~combined ~this-sym ~@arg-syms)]]
+                      `(~params-vec ~body))]]
+          `(~method-name ~@overload-clauses))]
     `(extend-type ~type-sym ~proto-sym ~@clauses)))
+
+(defn apply-wrappers-to-sigs [sigs]
+  (mapv (fn [sig]
+          (let [wrappers (nth sig sig-wrappers nil)
+                _ (println "Sig wrappers:" wrappers " for method" (first sig))
+                updated (apply-wrapper-args sig)
+                new-params (nth updated 2)
+                _ (println "Adjusted params to:" new-params)]
+            new-params))
+        sigs))
+
+(defn- build-protocol-method-sigs
+  "从原始方法签名和包装器调整后的参数向量构建协议方法签名列表。
+   返回 [(协议方法名 调整后参数) ...]"
+  [sigs adjusted-params]
+  (mapv (fn [sig params]
+          [(first sig) params])
+        sigs
+        adjusted-params))
 
 ;; ── 顶层宏：生成协议和实现 ──
 (defmacro use-class [java-class & opts]
   (let [opts-map (apply hash-map opts)
-        java-class-sym (->sym java-class)
-        proto-name (->sym (or (:protocol-name opts-map) (derive-protocol-name java-class-sym)))
+        java-class-sym (util/->sym java-class)
+        proto-sym (util/->sym (or (:protocol-name opts-map)
+                                  (default-proto-sym java-class-sym)))
         type-def (apply build-type-def java-class-sym (mapcat identity opts-map))
 
-        rename      (deep-unquote (:rename opts-map {}))
-        delegate    (deep-unquote (:delegate opts-map []))
-        custom      (deep-unquote (:custom opts-map []))
-        wrappers    (deep-unquote (:wrappers opts-map {}))
-        delegate-classes (deep-unquote (:delegate-classes opts-map nil))
-        rename-fn   (or (:rename-fn opts-map) bean-name->kebab-name)
+        rename      (util/deep-unquote (:rename opts-map {}))
+        delegate    (util/deep-unquote (:delegate opts-map []))
+        custom      (util/deep-unquote (:custom opts-map []))
+        wrappers    (util/deep-unquote (:wrappers opts-map {}))
+        delegate-classes (util/deep-unquote (:delegate-classes opts-map nil))
+        rename-fn   (or (:rename-fn opts-map) util/bean-name->kebab-name)
         resolve-name (fn [orig-name]
                        (let [renamed (or (get rename orig-name) orig-name)]
                          (if rename-fn (rename-fn renamed) renamed)))
@@ -616,16 +677,13 @@
         type-def (inject-impl-in-type-def type-def policies)
         type-def (wrap-impl-in-type-def type-def wrappers)
         ;; ★ 计算包装器参数（只取修改后的参数向量，不改变 type-def）
-        proto-params-list (mapv #(let [updated (apply-wrapper-args %)]
-                                   (nth updated 2))
-                                (::spec/method-sigs type-def))
-        proto-def (type-def->protocol-def type-def proto-name)
+        proto-params-list (apply-wrappers-to-sigs (::spec/method-sigs type-def))
+        proto-def (type-def->protocol-def type-def proto-sym)
         ;; ★ 替换协议方法签名
         proto-def (assoc proto-def ::spec/protocol-method-sigs
-                                   (mapv (fn [sig params]
-                                           [(first sig) params])
-                                         (::spec/method-sigs type-def)
-                                         proto-params-list))]
+                                   (build-protocol-method-sigs
+                                     (::spec/method-sigs type-def)
+                                     proto-params-list))]
     `(do
        ~(emit-defprotocol proto-def)
-       ~(emit-extend-type type-def proto-def))))
+       ~(emit-extend-type type-def proto-sym proto-params-list))))

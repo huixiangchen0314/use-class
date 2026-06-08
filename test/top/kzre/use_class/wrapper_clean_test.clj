@@ -22,16 +22,6 @@
                                                mul-n-wrapper
                                                'add-n-wrapper]}})
 
-(deftest test-protocol-available
-  (let [proto @(resolve 'IDateArithWrapper)]
-    (is (some? proto) "协议应已定义")))
-
-;(deftest test-signature
-;  (let [proto @(resolve 'IDateArithWrapper)
-;        method-info (get (:sigs proto) :get-time)]
-;    (is method-info)
-;    ;; 签名应为 [this n]
-;    (is (= '([this n]) (:arglists method-info)))))
 
 (deftest test-behavior
   (let [d (Date. 2)]

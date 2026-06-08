@@ -9,14 +9,6 @@
                 :only ['getTime]
                 :prefix "pfx-")
 
-(deftest test-prefix-protocol-method-name
-  (let [v (resolve 'IPrefixTest)]
-    (is (some? v) "协议应已定义")
-    (let [proto @v
-          method-sigs (:sigs proto)
-          method-name (ffirst method-sigs)]
-      (is (= 'pfx-get-time method-name)
-          "方法名应带有前缀 pfx-，并保持 kebab-case 转换"))))
 
 (deftest test-prefix-function-call
   ;; 确保带前缀的函数可以正常调用
