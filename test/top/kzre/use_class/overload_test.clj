@@ -28,13 +28,14 @@
 
 (deftest test-use-class-overload-protocol
   (let [cal (Calendar/getInstance)]
-    (testing "2-arg set"
+    (testing "2-arg set (year only)"
       (is (nil? (set-cal! cal Calendar/YEAR 2020)))
       (is (= 2020 (.get cal Calendar/YEAR))))
-    (testing "3-arg set"
+    (testing "3-arg set (year, month, date)"
+      ;; Calendar 月份：0=January, 所以 5=June
       (is (nil? (set-cal! cal 2021 5 10)))
       (is (= 2021 (.get cal Calendar/YEAR)))
-      (is (= 5 (.get cal Calendar/MONTH)))
+      (is (= 5 (.get cal Calendar/MONTH)))      ; 5 表示六月
       (is (= 10 (.get cal Calendar/DAY_OF_MONTH))))))
 
 ;; ── 测试默认只保留最大 arity ──
