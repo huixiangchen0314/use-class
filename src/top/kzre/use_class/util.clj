@@ -86,3 +86,8 @@
 (defn deep-unquote
   [coll]
   (walk/postwalk unquote-form coll))
+
+
+(defn setter-name? [sym]
+  (let [s (name sym)]
+    (re-find #"^set[A-Z]" s)))

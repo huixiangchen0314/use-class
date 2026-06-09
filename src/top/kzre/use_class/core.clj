@@ -141,18 +141,14 @@
                        sigs)))))
 
 ;; ── 危险标记 ──
-(defn- setter-name? [sym]
-  (let [s (name sym)]
-    (and (str/starts-with? s "set-") (> (count s) 4))))
-
 (defn mark-dangerous-in-type-def
   [type-def danger-set & {:keys [setter-danger?] :or {setter-danger? true}}]
   (update type-def ::spec/method-sigs
           (fn [sigs]
             (mapv (fn [[proto java params vararg-type]]
                     (if (and (not (str/ends-with? (name proto) "!"))
-                             (or (contains? danger-set proto)
-                                 (and setter-danger? (setter-name? proto))))
+                             (or (contains? danger-set java)
+                                 (and setter-danger? (util/setter-name? java))))
                       [(symbol (str (name proto) "!")) java params vararg-type]
                       [proto java params vararg-type]))
                   sigs))))
@@ -356,7 +352,9 @@
         type-def (rename-methods-in-type-def type-def rename rename-fn)
         _ (println "After rename, methods:" (mapv first (::spec/method-sigs type-def)))
         type-def (add-prefix-to-type-def type-def prefix)
+        _ (println "After prefix, methods:" (mapv first (::spec/method-sigs type-def)))
         type-def (mark-dangerous-in-type-def type-def dangerous :setter-danger? setter-danger?)
+        _ (println "After dangerous, methods:" (mapv first (::spec/method-sigs type-def)))
         ]
     type-def))
 
@@ -565,6 +563,7 @@
            (filter #(= "invoke" (.getName %)))
            (map #(count (.getParameterTypes %)))
            (reduce max 0)))))
+
 (defn apply-wrapper-args [method-sig]
   (let [wrappers (nth method-sig 5 nil)]
     (println "[apply-wrapper-args] wrappers:" wrappers)
@@ -800,12 +799,13 @@
         ;; [java-method, arity]->impl
         ;; 构建 [协议方法名, 固定参数个数] → 原始签名 的查找表
         ;; 对于变参方法，将其从 base-arity 到 base-arity+max-n 的所有 arity 都映射到同一条原始签名
+        ;; 基于包装器调整后的参数构建 arity-lookup
         arity-lookup
-        (reduce (fn [m sig]
+        (reduce (fn [m [sig adjusted-params]]
                   (let [proto-name (first sig)
-                        params (nth sig 2)
-                        base-arity (java-arity params)]
-                    (if (some '#{&} params)
+                        base-arity (java-arity adjusted-params)      ;; 调整后的固定参数个数
+                        is-varargs? (some '#{&} adjusted-params)]
+                    (if is-varargs?
                       (let [max-extra (get varargs-per proto-name varargs-max)]
                         (reduce (fn [m2 extra]
                                   (assoc m2 [proto-name (+ base-arity extra)] sig))
@@ -813,7 +813,7 @@
                                 (range (inc max-extra))))
                       (assoc m [proto-name base-arity] sig))))
                 {}
-                (::spec/method-sigs type-def))
+                (map vector (::spec/method-sigs type-def) proto-params-list))
         ]
     `(do
        ~(emit-defprotocol proto-sym filtered-specs)
