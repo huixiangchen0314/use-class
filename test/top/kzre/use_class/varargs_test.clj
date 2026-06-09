@@ -5,7 +5,8 @@
     [top.kzre.use-class.core :as core])
   (:import
     (clojure.lang ArityException)
-    (java.util Formatter)))
+    (java.util Formatter)
+    (top.kzre.use_class VarargsDemo)))
 
 (defn format-wrapper [f]
   (with-meta
@@ -63,5 +64,23 @@
   (let [f (Formatter.)]
     (is (= "C B A" (fmt4 f "%s %s %s" "A" "B" "C")))))
 
-;; 运行所有测试
-(clojure.test/run-tests)
+
+
+(defn sum-wrapper [f]
+  "包装器：将返回值转为大写，用于验证包装器与变参配合。"
+  (with-meta
+    (fn [this prefix & nums]
+      (s/upper-case (apply f this prefix nums)))
+    {:arglists '([this prefix & nums])}))
+
+(core/use-class VarargsDemo
+                :protocol-name 'IVarargsDemo
+                :only [['sum 1]]           ;; 固定参数个数为1（前缀）
+                :rename {'sum 'compute}
+                :wrappers {:methods {'sum [sum-wrapper]}})
+
+(deftest test-non-string-varargs
+  (let [obj (VarargsDemo.)]
+    (is (= "RESULT6" (compute obj "Result" 1 2 3)))
+    (is (= "X0" (compute obj "X")))))      ;; 不传任何整数
+

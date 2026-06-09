@@ -11,6 +11,10 @@ all: clean test jar
 clean:
 	clj -T:build clean
 
+# 编译测试用 Java 源文件
+compile-test-java:
+	javac -source 8 -target 8 -d target/test-classes test/top/kzre/use_class/VarargsDemo.java
+
 # 运行所有测试
 test:
 	clj -M:test -e "(require 'top.kzre.use-class.core-test) (clojure.test/run-tests 'top.kzre.use-class.core-test)"
@@ -18,6 +22,7 @@ test:
 	clj -M:test -e "(require 'top.kzre.use-class.optional-wrapper-test) (clojure.test/run-tests 'top.kzre.use-class.optional-wrapper-test)"
 	clj -M:test -e "(require 'top.kzre.use-class.prefix-test) (clojure.test/run-tests 'top.kzre.use-class.prefix-test)"
 	clj -M:test -e "(require 'top.kzre.use-class.overload-test) (clojure.test/run-tests 'top.kzre.use-class.overload-test)"
+	clj -M:test -e "(require 'top.kzre.use-class.varargs-test) (clojure.test/run-tests 'top.kzre.use-class.varargs-test)"
 
 # 构建 JAR（直接调用 tools.build，由它判断文件是否变化）
 jar:

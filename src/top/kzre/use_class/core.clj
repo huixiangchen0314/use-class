@@ -9,10 +9,20 @@
 (def ^:const sig-proto     0)  ; 协议方法名
 (def ^:const sig-java      1)  ; 原始 Java 方法名
 (def ^:const sig-params    2)  ; 参数向量（含 this）
-(def ^:const sig-return    3)  ; 返回类型
+(def ^:const sig-vararg-type    3)  ; 返回类型
 (def ^:const sig-impl      4)  ; 实现策略
 (def ^:const sig-wrappers  5)  ; 包装器列表
 
+(def ^:private primitive-type-map
+  "将原始类型符号映射到对应的 Class 符号，供 into-array 使用。"
+  {'int 'Integer/TYPE
+   'boolean 'Boolean/TYPE
+   'byte 'Byte/TYPE
+   'short 'Short/TYPE
+   'long 'Long/TYPE
+   'char 'Character/TYPE
+   'float 'Float/TYPE
+   'double 'Double/TYPE})
 
 ;; ================ Resolve Java Type ==================================
 (defn- java-arity [params]
@@ -44,8 +54,13 @@
         params   (if varargs?
                    (vec (concat ['this] (repeatedly (dec arity) #(gensym "arg")) ['& (gensym "rest")]))
                    (vec (cons 'this (repeatedly arity #(gensym "arg")))))
-        return   (symbol (.getName (.getReturnType m)))]
-    [jname jname params return]))
+        vararg-type (when varargs?
+                      (let [last-param-type (last (.getParameterTypes m))]
+                        (when (.isArray last-param-type)
+                          (let [component-type (.getComponentType last-param-type)
+                                type-sym (symbol (.getName component-type))]
+                            (get primitive-type-map type-sym type-sym)))))] ; 原始类型转包装类 TYPE
+    [jname jname params vararg-type]))
 
 (defn resolve-type
   "解析 Java 类型。接受：
@@ -79,8 +94,8 @@
                       orig-name))]
     (update type-def ::spec/method-sigs
             (fn [sigs]
-              (mapv (fn [[proto java params return]]
-                      [(newname proto) java params return])
+              (mapv (fn [[proto java params vararg-type]]
+                      [(newname proto) java params vararg-type])
                     sigs)))))
 
 ;; ── 前缀 ──
@@ -89,8 +104,8 @@
   (if prefix
     (update type-def ::spec/method-sigs
             (fn [sigs]
-              (mapv (fn [[proto java params return]]
-                      [(symbol (str prefix (name proto))) java params return])
+              (mapv (fn [[proto java params vararg-type]]
+                      [(symbol (str prefix (name proto))) java params vararg-type])
                     sigs)))
     type-def))
 
@@ -134,12 +149,12 @@
   [type-def danger-set & {:keys [setter-danger?] :or {setter-danger? true}}]
   (update type-def ::spec/method-sigs
           (fn [sigs]
-            (mapv (fn [[proto java params return]]
+            (mapv (fn [[proto java params vararg-type]]
                     (if (and (not (str/ends-with? (name proto) "!"))
                              (or (contains? danger-set proto)
                                  (and setter-danger? (setter-name? proto))))
-                      [(symbol (str (name proto) "!")) java params return]
-                      [proto java params return]))
+                      [(symbol (str (name proto) "!")) java params vararg-type]
+                      [proto java params vararg-type]))
                   sigs))))
 
 ;; ── 去重 ──
@@ -165,7 +180,7 @@
 (defn dedupe-methods [type-def]
   (update type-def ::spec/method-sigs
           (fn [sigs]
-            (vec (vals (reduce (fn [m [proto java params return :as sig]]
+            (vec (vals (reduce (fn [m [proto java params vararg-type :as sig]]
                                  (let [arity (java-arity params)]
                                    (if-let [existing (get m proto)]
                                      (let [existing-arity (dec (count (nth existing 2)))]
@@ -265,10 +280,10 @@
                   target-sig    (resolve-conflict-methods (::spec/method-sigs target-td) target-method)
                   _             (when-not target-sig
                                   (throw (ex-info (str "Target method " target-method " not found in " ret-class-sym) {})))]
-              (let [[_ target-java target-params target-return] target-sig
+              (let [[_ target-java target-params target-vararg-type] target-sig
                     new-params (cons 'this (rest target-params))]
                 ;; proto-name 暂用 target-method（原始 Java 名），后续由 rename 处理
-                [[target-method target-java new-params target-return]])))
+                [[target-method target-java new-params target-vararg-type]])))
           delegate-config)]
     (merge-type-def host-type-def
                     {::spec/type-name ::merge-placeholder
@@ -417,17 +432,17 @@
       method-sym)))
 
 (defn direct-impl-policy [& {:keys [rename-inverse]}]
-  (fn [[proto java params return :as sig] cls]
+  (fn [[proto java params vararg-type :as sig] cls]
     (when (find-method-by-name-and-arity cls java (java-arity params))
-      [proto java params return {:delegate java}])))
+      [proto java params vararg-type {:delegate java}])))
 
 (defn delegate-impl-policy [delegate-config]
   (let [mapping (into {} (map (fn [[proto-fn getter target-method]]
                                 [proto-fn {:delegate {:getter getter :method target-method}}])
                               delegate-config))]
-    (fn [[proto java params return :as sig] cls]
+    (fn [[proto java params vararg-type :as sig] cls]
       (when-let [impl (get mapping proto)]
-        [proto java params return impl]))))
+        [proto java params vararg-type impl]))))
 
 (defn custom-impl-policy
   "返回一个策略函数，根据用户提供的自定义方法配置来提供实现。
@@ -450,15 +465,15 @@
                             (assoc m key {:custom impl-fn})))
                         {}
                         entries)]
-    (fn [[proto java params return :as sig] cls]
+    (fn [[proto java params vararg-type :as sig] cls]
       (let [fixed-arity (java-arity params)
             result (or (get mapping [proto fixed-arity])
                        (get mapping proto))]
         (when result
-          [proto java params return result])))))
+          [proto java params vararg-type result])))))
 
 (defn smart-delegate-policy [& {:keys [rename-inverse delegate-classes]}]
-  (fn [[proto java params return :as sig] cls]
+  (fn [[proto java params vararg-type :as sig] cls]
     (let [java-name java
           arity (java-arity params)
           getters (if delegate-classes
@@ -469,7 +484,7 @@
               (when (and (zero? (.getParameterCount g))
                          (not= java.lang.Void/TYPE (.getReturnType g)))
                 (when-let [target (find-method-by-name-and-arity (.getReturnType g) java-name arity)]
-                  [proto java params return
+                  [proto java params vararg-type
                    {:delegate {:getter (symbol (.getName g))
                                :method java-name}}])))
             getters))))
@@ -652,7 +667,7 @@
                                 _ (when-not sig
                                     (throw (ex-info (str "No implementation for " method-name
                                                          " with arity " fixed-arity) {})))
-                                [_ java orig-params _ impl wrappers] sig
+                                [_ java orig-params vararg-type impl wrappers] sig
                                 this-sym   (first params)
                                 arg-syms   (rest params)
                                 orig-arg-syms (rest orig-params)
@@ -667,7 +682,7 @@
                                                                `(let [obj# (. ~this-sym ~getter)]
                                                                   (. obj# ~method ~@fixed (into-array Object ~vararg)))))
                                                  :custom `(~(second impl) ~this-sym ~@fixed ~vararg)
-                                                 `(. ~this-sym ~java ~@fixed (into-array Object ~vararg))))
+                                                 `(. ~this-sym ~java ~@fixed (into-array ~vararg-type ~vararg))))
                                              (impl-expr impl this-sym orig-arg-syms))
                                 inner-fn   `(fn [~this-sym ~@orig-arg-syms] ~raw-body)
                                 combined   (reduce (fn [acc w] `(~w ~acc)) inner-fn wrappers)
