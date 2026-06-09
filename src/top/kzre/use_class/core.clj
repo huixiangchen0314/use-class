@@ -316,9 +316,9 @@
 
 (defn build-type-def
   [java-class-sym & {:keys [only except
-                        rename rename-fn dangerous setter-danger? prefix
-                        delegate custom ]
-                 :or {rename {} dangerous #{} setter-danger? true delegate [] custom [] prefix nil}}]
+                            rename rename-fn dangerous setter-danger? prefix
+                            delegate custom ]
+                     :or {rename {} dangerous #{} setter-danger? true delegate [] custom [] prefix nil}}]
   (let [only  (util/deep-unquote only)
         except (util/deep-unquote except)
         default-include (nil? only)
@@ -676,10 +676,10 @@
                                                    vararg (last orig-arg-syms)]
                                                (case (first impl)
                                                  :delegate (if (symbol? (second impl))
-                                                             `(. ~this-sym ~(second impl) ~@fixed (into-array Object ~vararg))
+                                                             `(. ~this-sym ~(second impl) ~@fixed (into-array ~vararg-type ~vararg))
                                                              (let [{:keys [getter method]} (second impl)]
                                                                `(let [obj# (. ~this-sym ~getter)]
-                                                                  (. obj# ~method ~@fixed (into-array Object ~vararg)))))
+                                                                  (. obj# ~method ~@fixed (into-array ~vararg-type ~vararg)))))
                                                  :custom `(~(second impl) ~this-sym ~@fixed ~vararg)
                                                  `(. ~this-sym ~java ~@fixed (into-array ~vararg-type ~vararg))))
                                              (impl-expr impl this-sym orig-arg-syms))

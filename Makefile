@@ -16,7 +16,7 @@ compile-test-java:
 	javac -source 8 -target 8 -d target/test-classes test/top/kzre/use_class/VarargsDemo.java
 
 # 运行所有测试
-test:
+test: compile-test-java
 	clj -M:test -e "(require 'top.kzre.use-class.core-test) (clojure.test/run-tests 'top.kzre.use-class.core-test)"
 	clj -M:test -e "(require 'top.kzre.use-class.wrapper-clean-test) (clojure.test/run-tests 'top.kzre.use-class.wrapper-clean-test)"
 	clj -M:test -e "(require 'top.kzre.use-class.optional-wrapper-test) (clojure.test/run-tests 'top.kzre.use-class.optional-wrapper-test)"

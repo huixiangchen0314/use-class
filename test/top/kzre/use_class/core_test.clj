@@ -45,7 +45,7 @@
       (let [r (core/mark-dangerous-in-type-def td #{})]
         (is (some #(= 'set-time! %) (map first (::spec/method-sigs r))))))
     (testing "explicit danger"
-      (let [r (core/mark-dangerous-in-type-def td #{'get-time} :setter-danger? false)]
+      (let [r (core/mark-dangerous-in-type-def td #{'getTime} :setter-danger? false)]
         (is (some #(= 'get-time! %) (map first (::spec/method-sigs r))))))))
 
 ;; ── build-type-def ──
@@ -74,7 +74,7 @@
                                 :delegate [['getTime 'getTime]]
                                 :rename {'getTime 'time-accessor}
                                 :only ['getTime]
-                                :dangerous #{'time-accessor})]
+                                :dangerous #{'getTime})]
     (is (= #{'time-accessor!} (set (map first (::spec/method-sigs td)))))))
 
 ;; ── 包装器签名推断 ──
